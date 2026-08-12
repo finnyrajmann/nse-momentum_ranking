@@ -11,22 +11,27 @@ This job does NOT rebalance, does NOT touch positions, and does NOT affect
 the monthly momentum system in nse-momentum. It exists purely to build a
 day-by-day rank history for the bump-chart visualization.
 
-Fetch strategy: a single batched yf.download() call per run (threads=False),
-avoiding the per-symbol concurrent-fetch data corruption seen in earlier
-systems (same fix applied in trade-data-analysis).
+Fetch strategy: sequential per-symbol requests via Yahoo's chart API
+(same as the monthly rebalance system's fetch_closes()), with a sleep
+between calls. No yfinance dependency — the earlier concurrent-fetch data
+corruption issue (fixed in trade-data-analysis) came from parallel threads,
+not from this approach, so a plain sequential fetch never had that problem.
+This also keeps the deployed function well under DO's 48MB build size
+limit, which yfinance's dependency chain (notably curl_cffi) blew past.
 
-Requires: yfinance (see requirements.txt in this function's folder)
+No pip installs needed — requests + standard library only, same as your
+other four working systems.
 """
 
 import os
 import csv
+import time
 import base64
 import smtplib
 import traceback
 from io import StringIO
 from datetime import datetime, date
 import requests
-import yfinance as yf
 from email.mime.text import MIMEText
 
 # ─────────────────────────────────────────────
@@ -36,6 +41,8 @@ from email.mime.text import MIMEText
 DAYS_1M = 21
 DAYS_3M = 63
 DAYS_6M = 126
+
+SLEEP = 0.3  # seconds between Yahoo Finance calls, same as monthly system
 
 WATCHLIST_FILE = 'data/watchlist.csv'
 HISTORY_FILE   = 'data/rank_history.csv'
@@ -86,27 +93,41 @@ def to_csv(rows, fieldnames):
 
 
 # ─────────────────────────────────────────────
-# MARKET DAY CHECK
+# YAHOO FINANCE (raw requests, sequential — same pattern as monthly system)
 # ─────────────────────────────────────────────
+
+def fetch_closes(symbol, period='1y'):
+    """Fetch daily close prices for a symbol. Returns list of (timestamp, close) or None."""
+    ticker  = symbol.upper().strip() + '.NS'
+    url     = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}'
+    params  = {'range': period, 'interval': '1d', 'events': 'history'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        r    = requests.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
+        res  = data['chart']['result'][0]
+        closes = res['indicators']['quote'][0]['close']
+        timestamps = res['timestamp']
+        pairs = [(t, c) for t, c in zip(timestamps, closes) if c is not None]
+        return pairs
+    except Exception as e:
+        print(f'  {symbol}: fetch error — {e}')
+        return None
+
 
 def is_market_open():
     """Quick single-symbol check to detect trading holidays/weekends."""
-    try:
-        df = yf.download(MARKET_CHECK_SYM + '.NS', period='5d', interval='1d',
-                          threads=False, progress=False, auto_adjust=True)
-        if df.empty:
-            return False
-        last_date = df.index[-1].date()
-        today = date.today()
-        print(f'  Market check: last bar = {last_date}, today = {today}')
-        return last_date == today
-    except Exception as e:
-        print(f'  Market check failed: {e}')
+    pairs = fetch_closes(MARKET_CHECK_SYM, period='5d')
+    if not pairs:
         return False
+    last_date = datetime.utcfromtimestamp(pairs[-1][0]).date()
+    today = date.today()
+    print(f'  Market check: last bar = {last_date}, today = {today}')
+    return last_date == today
 
 
 # ─────────────────────────────────────────────
-# BATCHED MOMENTUM SCORING
+# MOMENTUM SCORING
 # ─────────────────────────────────────────────
 
 def compute_return(closes, lookback_days):
@@ -134,51 +155,51 @@ def compute_volatility(closes, lookback_days):
     return variance ** 0.5
 
 
+def score_stock(symbol):
+    """
+    Compute momentum score for one stock via a single sequential fetch.
+    Returns dict with score and components, or None on failure.
+    """
+    pairs = fetch_closes(symbol, period='1y')
+    time.sleep(SLEEP)
+    if not pairs or len(pairs) < DAYS_6M + 5:
+        return None
+
+    closes = [c for _, c in pairs]
+
+    r1m = compute_return(closes, DAYS_1M)
+    r3m = compute_return(closes, DAYS_3M)
+    r6m = compute_return(closes, DAYS_6M)
+    vol1m = compute_volatility(closes, DAYS_1M)
+
+    if any(v is None for v in [r1m, r3m, r6m, vol1m]) or vol1m == 0:
+        return None
+
+    score = (r1m + r3m + r6m) / vol1m
+    return {
+        'symbol': symbol.strip().upper(),
+        'score': round(score, 4),
+        'price': round(closes[-1], 2),
+        'r1m': round(r1m, 2),
+        'r3m': round(r3m, 2),
+        'r6m': round(r6m, 2),
+        'vol1m': round(vol1m, 4),
+    }
+
+
 def score_universe(symbols):
     """
-    Single batched download for the whole watchlist, then score each symbol
-    from the in-memory result. No per-symbol network calls — this is the
-    fix for the concurrent-fetch corruption issue seen in earlier systems.
+    Score and rank all stocks sequentially — one Yahoo request at a time,
+    same pattern as the monthly rebalance system's rank_universe().
     """
-    tickers = [s.strip().upper() + '.NS' for s in symbols]
-    print(f'  Batched download: {len(tickers)} tickers...')
-
-    data = yf.download(
-        tickers, period='1y', interval='1d',
-        group_by='ticker', threads=False, progress=False, auto_adjust=True
-    )
-
+    print(f'  Scoring {len(symbols)} stocks (sequential)...')
     scored = []
-    for symbol, ticker in zip(symbols, tickers):
-        try:
-            if len(tickers) == 1:
-                closes = data['Close'].dropna().tolist()
-            else:
-                closes = data[ticker]['Close'].dropna().tolist()
-        except Exception:
-            continue
-
-        if len(closes) < DAYS_6M + 5:
-            continue
-
-        r1m = compute_return(closes, DAYS_1M)
-        r3m = compute_return(closes, DAYS_3M)
-        r6m = compute_return(closes, DAYS_6M)
-        vol1m = compute_volatility(closes, DAYS_1M)
-
-        if any(v is None for v in [r1m, r3m, r6m, vol1m]) or vol1m == 0:
-            continue
-
-        score = (r1m + r3m + r6m) / vol1m
-        scored.append({
-            'symbol': symbol.strip().upper(),
-            'score': round(score, 4),
-            'price': round(closes[-1], 2),
-            'r1m': round(r1m, 2),
-            'r3m': round(r3m, 2),
-            'r6m': round(r6m, 2),
-            'vol1m': round(vol1m, 4),
-        })
+    for i, symbol in enumerate(symbols):
+        result = score_stock(symbol)
+        if result:
+            scored.append(result)
+        if (i + 1) % 50 == 0:
+            print(f'  Progress: {i + 1}/{len(symbols)} scored: {len(scored)}')
 
     scored.sort(key=lambda x: x['score'], reverse=True)
     for i, s in enumerate(scored):
@@ -238,7 +259,7 @@ def main(args):
         symbols = [row['Symbol'] for row in watchlist]
         print(f'  Watchlist: {len(symbols)} symbols')
 
-        print('\n[3/4] Scoring universe (batched fetch)...')
+        print('\n[3/4] Scoring universe (sequential fetch)...')
         ranked = score_universe(symbols)
         if len(ranked) < 50:
             msg = f'Only {len(ranked)} stocks scored \u2014 too few, skipping write'
