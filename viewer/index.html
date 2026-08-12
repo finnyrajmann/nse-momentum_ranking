@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Momentum Rank Flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #10161f;
+    --panel-2: #141b26;
+    --border: #232b38;
+    --text: #e6ebf2;
+    --text-dim: #7c8aa0;
+    --text-faint: #4a5568;
+    --accent: #f0a94a;
+    --accent-soft: rgba(240, 169, 74, 0.14);
+    --grid: #1a2230;
+    --up: #4ade80;
+    --down: #f87171;
+    --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+    --sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 100%;
+    padding: 18px 20px 32px;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 18px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .title-block {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin: 0;
+    color: var(--text);
+  }
+
+  .subtitle {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .toggle-group {
+    display: flex;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .toggle-group button {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    background: transparent;
+    color: var(--text-dim);
+    border: none;
+    padding: 7px 13px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .toggle-group button + button { border-left: 1px solid var(--border); }
+
+  .toggle-group button:hover { color: var(--text); }
+
+  .toggle-group button.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .status {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
+  .status.err { color: var(--down); }
+
+  #chart-container {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  #chart-container::-webkit-scrollbar { height: 10px; }
+  #chart-container::-webkit-scrollbar-track { background: var(--panel); }
+  #chart-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+
+  svg { display: block; }
+
+  .empty-state {
+    padding: 60px 30px;
+    text-align: center;
+    color: var(--text-dim);
+    font-family: var(--sans);
+  }
+
+  .empty-state .big { font-size: 14px; color: var(--text); margin-bottom: 6px; }
+  .empty-state .small { font-size: 12px; font-family: var(--mono); }
+
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: #0d1219;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 50;
+    display: none;
+    min-width: 170px;
+  }
+
+  .tooltip .sym {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--accent);
+    margin-bottom: 4px;
+    display: block;
+  }
+
+  .tooltip .row { display: flex; justify-content: space-between; gap: 16px; }
+  .tooltip .row .k { color: var(--text-dim); }
+  .tooltip .reentry-note {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    color: var(--accent);
+    font-size: 10px;
+  }
+
+  footer {
+    margin-top: 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
+  footer a { color: var(--text-dim); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="title-block">
+      <h1>Momentum Rank Flow</h1>
+      <span class="subtitle" id="range-label">—</span>
+    </div>
+    <div class="controls">
+      <div class="toggle-group" id="topn-toggle">
+        <button data-n="25" class="active">TOP 25</button>
+        <button data-n="50">TOP 50</button>
+      </div>
+      <div class="toggle-group" id="window-toggle">
+        <button data-days="90" class="active">90D</button>
+        <button data-days="180">6M</button>
+      </div>
+      <span class="status" id="status">loading…</span>
+    </div>
+  </header>
+
+  <div id="chart-container">
+    <div class="empty-state" id="empty-state" style="display:none;">
+      <div class="big">Not enough history yet</div>
+      <div class="small">Check back after a few more trading days.</div>
+    </div>
+    <svg id="chart"></svg>
+  </div>
+
+  <footer>
+    source: <span id="source-url"></span> · re-entry marker (◎) = stock re-appeared in the ranked window after dropping out
+  </footer>
+
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────────
+const GITHUB_OWNER  = 'finnyrajmann';
+const GITHUB_REPO   = 'nse-momentum_ranking';
+const GITHUB_BRANCH = 'main';
+const CSV_PATH      = 'data/rank_history.csv';
+const RAW_URL = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${CSV_PATH}`;
+
+document.getElementById('source-url').textContent = `${GITHUB_OWNER}/${GITHUB_REPO}/${CSV_PATH}`;
+
+// ── STATE ───────────────────────────────────────────────
+let allRows = [];       // parsed CSV rows
+let topN = 25;
+let windowDays = 90;
+
+const ROW_H = 22;        // vertical px per rank slot
+const COL_W = 46;        // horizontal px per trading day
+const MARGIN = { top: 24, right: 90, bottom: 34, left: 34 };
+const GOLDEN_ANGLE = 137.508;
+
+// ── FETCH + PARSE ───────────────────────────────────────
+async function loadData() {
+  const statusEl = document.getElementById('status');
+  try {
+    const res = await fetch(RAW_URL + '?t=' + Date.now());
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    allRows = parseCSV(text);
+    statusEl.textContent = `${allRows.length.toLocaleString()} rows loaded`;
+    statusEl.classList.remove('err');
+    render();
+  } catch (e) {
+    statusEl.textContent = 'failed to load data — ' + e.message;
+    statusEl.classList.add('err');
+    console.error(e);
+  }
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  const headers = lines[0].split(',');
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(',');
+    if (cells.length < headers.length) continue;
+    const row = {};
+    headers.forEach((h, idx) => row[h.trim()] = cells[idx]);
+    row.rank = parseInt(row.rank, 10);
+    row.score = parseFloat(row.score);
+    row.price = parseFloat(row.price);
+    row.r1m = parseFloat(row.r1m);
+    row.r3m = parseFloat(row.r3m);
+    row.r6m = parseFloat(row.r6m);
+    row.vol1m = parseFloat(row.vol1m);
+    rows.push(row);
+  }
+  return rows;
+}
+
+// ── DATA SHAPING ────────────────────────────────────────
+function buildModel() {
+  const dates = [...new Set(allRows.map(r => r.date))].sort();
+  const cutoffIdx = Math.max(0, dates.length - windowDays);
+  const windowDates = dates.slice(cutoffIdx);
+  const dateIndex = new Map(windowDates.map((d, i) => [d, i]));
+
+  const byDate = new Map();
+  windowDates.forEach(d => byDate.set(d, []));
+  for (const r of allRows) {
+    if (dateIndex.has(r.date) && r.rank <= topN) {
+      byDate.get(r.date).push(r);
+    }
+  }
+
+  // per-symbol presence across the window
+  const bySymbol = new Map();
+  for (const d of windowDates) {
+    for (const r of byDate.get(d)) {
+      if (!bySymbol.has(r.symbol)) bySymbol.set(r.symbol, []);
+      bySymbol.get(r.symbol).push(r);
+    }
+  }
+
+  // split into runs (consecutive-day segments) per symbol
+  const runs = [];
+  for (const [symbol, points] of bySymbol.entries()) {
+    points.sort((a, b) => dateIndex.get(a.date) - dateIndex.get(b.date));
+    let current = [];
+    let prevIdx = null;
+    for (const p of points) {
+      const idx = dateIndex.get(p.date);
+      if (prevIdx !== null && idx !== prevIdx + 1) {
+        runs.push({ symbol, points: current });
+        current = [];
+      }
+      current.push(p);
+      prevIdx = idx;
+    }
+    if (current.length) runs.push({ symbol, points: current });
+  }
+  // mark re-entries (2nd+ run for a symbol within this window)
+  const seenCount = new Map();
+  runs.sort((a, b) => dateIndex.get(a.points[0].date) - dateIndex.get(b.points[0].date));
+  for (const run of runs) {
+    const n = (seenCount.get(run.symbol) || 0) + 1;
+    seenCount.set(run.symbol, n);
+    run.isReentry = n > 1;
+  }
+
+  return { windowDates, dateIndex, runs };
+}
+
+function colorForRunIndex(i) {
+  const hue = (i * GOLDEN_ANGLE) % 360;
+  return `hsl(${hue.toFixed(0)}, 68%, 62%)`;
+}
+
+// ── RENDER ──────────────────────────────────────────────
+function render() {
+  const { windowDates, dateIndex, runs } = buildModel();
+  const svg = document.getElementById('chart');
+  const emptyState = document.getElementById('empty-state');
+  const rangeLabel = document.getElementById('range-label');
+
+  if (windowDates.length === 0) {
+    svg.style.display = 'none';
+    emptyState.style.display = 'block';
+    return;
+  }
+  svg.style.display = 'block';
+  emptyState.style.display = 'none';
+
+  rangeLabel.textContent = `${windowDates[0]} → ${windowDates[windowDates.length - 1]} · ${windowDates.length} trading day${windowDates.length > 1 ? 's' : ''}`;
+
+  const width = MARGIN.left + MARGIN.right + Math.max(windowDates.length - 1, 0) * COL_W + (windowDates.length === 1 ? COL_W : 0);
+  const height = MARGIN.top + MARGIN.bottom + topN * ROW_H;
+
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.innerHTML = '';
+
+  const ns = 'http://www.w3.org/2000/svg';
+  const g = (tag, attrs) => {
+    const el = document.createElementNS(ns, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  };
+
+  const xFor = (dIdx) => MARGIN.left + dIdx * COL_W + COL_W / 2;
+  const yFor = (rank) => MARGIN.top + (rank - 0.5) * ROW_H;
+
+  // gridlines — rank rows
+  for (let rk = 1; rk <= topN; rk++) {
+    if (rk % 5 === 0 || rk === 1) {
+      svg.appendChild(g('line', {
+        x1: MARGIN.left, x2: width - MARGIN.right,
+        y1: yFor(rk), y2: yFor(rk),
+        stroke: 'var(--grid)', 'stroke-width': 1
+      }));
+      const lbl = g('text', {
+        x: 10, y: yFor(rk) + 4,
+        fill: 'var(--text-faint)', 'font-family': 'var(--mono)', 'font-size': 10
+      });
+      lbl.textContent = rk;
+      svg.appendChild(lbl);
+    }
+  }
+
+  // date axis labels (sparse, avoid clutter)
+  const labelEvery = Math.max(1, Math.ceil(windowDates.length / 14));
+  windowDates.forEach((d, i) => {
+    if (i % labelEvery === 0 || i === windowDates.length - 1) {
+      const lbl = g('text', {
+        x: xFor(i), y: height - 12,
+        fill: 'var(--text-faint)', 'font-family': 'var(--mono)', 'font-size': 10,
+        'text-anchor': 'middle'
+      });
+      lbl.textContent = d.slice(5); // MM-DD
+      svg.appendChild(lbl);
+    }
+  });
+
+  const tooltip = document.getElementById('tooltip');
+
+  runs.forEach((run, runIdx) => {
+    const color = colorForRunIndex(runIdx);
+    const pts = run.points.map(p => ({
+      x: xFor(dateIndex.get(p.date)),
+      y: yFor(p.rank),
+      data: p
+    }));
+
+    const grp = g('g', { class: 'strand', 'data-symbol': run.symbol });
+
+    if (pts.length > 1) {
+      const d = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x + ',' + p.y).join(' ');
+      const path = g('path', {
+        d, fill: 'none', stroke: color, 'stroke-width': 2,
+        'stroke-linecap': 'round', 'stroke-linejoin': 'round', opacity: 0.9
+      });
+      grp.appendChild(path);
+    }
+
+    pts.forEach((p, i) => {
+      const isRunStart = i === 0;
+      const isRunEnd = i === pts.length - 1;
+      const r = isRunEnd ? 4 : 3;
+      const dot = g('circle', { cx: p.x, cy: p.y, r, fill: color });
+      grp.appendChild(dot);
+
+      if (isRunStart && run.isReentry) {
+        const ring = g('circle', {
+          cx: p.x, cy: p.y, r: 8, fill: 'none',
+          stroke: color, 'stroke-width': 1.5, 'stroke-dasharray': '2,2', opacity: 0.85
+        });
+        grp.appendChild(ring);
+      }
+
+      // hover target (invisible, larger)
+      const hitArea = g('circle', { cx: p.x, cy: p.y, r: 9, fill: 'transparent', style: 'cursor:pointer;' });
+      hitArea.addEventListener('mouseenter', (ev) => showTooltip(ev, p.data, run.isReentry && isRunStart));
+      hitArea.addEventListener('mousemove', (ev) => positionTooltip(ev));
+      hitArea.addEventListener('mouseleave', hideTooltip);
+      grp.appendChild(hitArea);
+
+      // symbol label at the end of each run
+      if (isRunEnd) {
+        const lbl = g('text', {
+          x: p.x + 9, y: p.y + 4,
+          fill: color, 'font-family': 'var(--mono)', 'font-size': 11, 'font-weight': 600
+        });
+        lbl.textContent = run.symbol;
+        grp.appendChild(lbl);
+      }
+    });
+
+    grp.addEventListener('mouseenter', () => grp.style.opacity = 1);
+    svg.appendChild(grp);
+  });
+
+  // dim all, highlight hovered symbol across its runs
+  svg.querySelectorAll('.strand').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      const sym = el.getAttribute('data-symbol');
+      svg.querySelectorAll('.strand').forEach(other => {
+        other.style.opacity = other.getAttribute('data-symbol') === sym ? '1' : '0.15';
+      });
+    });
+    el.addEventListener('mouseleave', () => {
+      svg.querySelectorAll('.strand').forEach(other => other.style.opacity = '1');
+    });
+  });
+}
+
+function showTooltip(ev, d, isReentry) {
+  const tt = document.getElementById('tooltip');
+  const pct = (v) => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  tt.innerHTML = `
+    <span class="sym">${d.symbol} <span style="color:var(--text-dim);font-weight:400;">#${d.rank}</span></span>
+    <div class="row"><span class="k">date</span><span>${d.date}</span></div>
+    <div class="row"><span class="k">price</span><span>₹${d.price}</span></div>
+    <div class="row"><span class="k">score</span><span>${d.score}</span></div>
+    <div class="row"><span class="k">1m / 3m / 6m</span><span>${pct(d.r1m)} / ${pct(d.r3m)} / ${pct(d.r6m)}</span></div>
+    <div class="row"><span class="k">1m vol</span><span>${d.vol1m}</span></div>
+    ${isReentry ? '<div class="reentry-note">◎ re-entered top ' + topN + '</div>' : ''}
+  `;
+  tt.style.display = 'block';
+  positionTooltip(ev);
+}
+function positionTooltip(ev) {
+  const tt = document.getElementById('tooltip');
+  tt.style.left = (ev.clientX + 16) + 'px';
+  tt.style.top = (ev.clientY + 16) + 'px';
+}
+function hideTooltip() {
+  document.getElementById('tooltip').style.display = 'none';
+}
+
+// ── CONTROLS ────────────────────────────────────────────
+document.getElementById('topn-toggle').addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  topN = parseInt(e.target.dataset.n, 10);
+  document.querySelectorAll('#topn-toggle button').forEach(b => b.classList.toggle('active', b === e.target));
+  render();
+});
+document.getElementById('window-toggle').addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  windowDays = parseInt(e.target.dataset.days, 10);
+  document.querySelectorAll('#window-toggle button').forEach(b => b.classList.toggle('active', b === e.target));
+  render();
+});
+
+loadData();
+</script>
+</body>
+</html>
