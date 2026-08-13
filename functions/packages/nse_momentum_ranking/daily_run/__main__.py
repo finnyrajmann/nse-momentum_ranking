@@ -46,7 +46,6 @@ SLEEP = 0.3  # seconds between Yahoo Finance calls, same as monthly system
 
 WATCHLIST_FILE = 'data/watchlist.csv'
 HISTORY_FILE   = 'data/rank_history.csv'
-MARKET_CHECK_SYM = 'RELIANCE'
 
 HISTORY_FIELDS = ['date', 'symbol', 'rank', 'score', 'price',
                    'r1m', 'r3m', 'r6m', 'vol1m']
@@ -116,14 +115,19 @@ def fetch_closes(symbol, period='1y'):
 
 
 def is_market_open():
-    """Quick single-symbol check to detect trading holidays/weekends."""
-    pairs = fetch_closes(MARKET_CHECK_SYM, period='5d')
-    if not pairs:
-        return False
-    last_date = datetime.utcfromtimestamp(pairs[-1][0]).date()
+    """
+    Weekday check only. We run before market open (8:50 AM IST), so
+    comparing the last fetched bar's date to "today" always fails —
+    today's candle doesn't exist yet at that hour, holiday or not.
+    Trade-off: this won't detect actual NSE holidays, so a holiday run
+    will just re-write yesterday's closing prices under today's date
+    (a harmless flat/no-movement row in the chart), rather than the
+    prior bug of silently skipping every single day forever.
+    """
     today = date.today()
-    print(f'  Market check: last bar = {last_date}, today = {today}')
-    return last_date == today
+    is_weekday = today.weekday() < 5  # Mon=0 ... Fri=4
+    print(f'  Market check: today = {today} ({today.strftime("%A")}), weekday = {is_weekday}')
+    return is_weekday
 
 
 # ─────────────────────────────────────────────
