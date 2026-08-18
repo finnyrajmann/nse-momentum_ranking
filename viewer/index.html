@@ -106,6 +106,12 @@
     color: var(--accent);
   }
 
+  /* formula toggle gets its own accent so it's visually distinct from topN/window */
+  .toggle-group.formula button.active {
+    background: rgba(96, 165, 250, 0.14);
+    color: #60a5fa;
+  }
+
   .status {
     font-family: var(--mono);
     font-size: 11px;
@@ -194,6 +200,10 @@
       <span class="subtitle" id="range-label">—</span>
     </div>
     <div class="controls">
+      <div class="toggle-group formula" id="formula-toggle">
+        <button data-profile="standard" class="active">1M/3M/6M</button>
+        <button data-profile="short">5D/10D/15D</button>
+      </div>
       <div class="toggle-group" id="topn-toggle">
         <button data-n="25" class="active">TOP 25</button>
         <button data-n="50">TOP 50</button>
@@ -227,13 +237,32 @@
 const GITHUB_OWNER  = 'finnyrajmann';
 const GITHUB_REPO   = 'nse-momentum_ranking';
 const GITHUB_BRANCH = 'main';
-const CSV_PATH      = 'data/rank_history.csv';
-const RAW_URL = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${CSV_PATH}`;
 
-document.getElementById('source-url').textContent = `${GITHUB_OWNER}/${GITHUB_REPO}/${CSV_PATH}`;
+// Both files are written daily by daily_run/__main__.py from the same
+// fetched price data — the DO function computes and persists the rank
+// for each formula, the viewer just picks which file to plot.
+const PROFILES = {
+  standard: {
+    label: '1M + 3M + 6M / 1M Vol',
+    csvPath: 'data/rank_history.csv',
+    tooltipReturnsLabel: '1m / 3m / 6m',
+    volLabel: '1m vol',
+    returnFields: ['r1m', 'r3m', 'r6m'],
+    volField: 'vol1m',
+  },
+  short: {
+    label: '5D + 10D + 15D / 5D Vol',
+    csvPath: 'data/rank_history_short.csv',
+    tooltipReturnsLabel: '5d / 10d / 15d',
+    volLabel: '5d vol',
+    returnFields: ['ret5', 'ret10', 'ret15'],
+    volField: 'vol5',
+  }
+};
 
 // ── STATE ───────────────────────────────────────────────
-let allRows = [];       // parsed CSV rows
+const rowCache = {};       // profile name -> parsed rows (fetched once, cached)
+let activeProfile = 'standard';
 let topN = 25;
 let windowDays = 90;
 
@@ -243,54 +272,74 @@ const MARGIN = { top: 24, right: 90, bottom: 34, left: 34 };
 const GOLDEN_ANGLE = 137.508;
 
 // ── FETCH + PARSE ───────────────────────────────────────
-async function loadData() {
+function rawUrlFor(profileName) {
+  const path = PROFILES[profileName].csvPath;
+  return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
+}
+
+async function loadProfile(profileName) {
   const statusEl = document.getElementById('status');
+  statusEl.textContent = 'loading…';
+  statusEl.classList.remove('err');
   try {
-    const res = await fetch(RAW_URL + '?t=' + Date.now());
+    const res = await fetch(rawUrlFor(profileName) + '?t=' + Date.now());
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
-    allRows = parseCSV(text);
-    statusEl.textContent = `${allRows.length.toLocaleString()} rows loaded`;
-    statusEl.classList.remove('err');
-    render();
+    const rows = parseCSV(text);
+    rowCache[profileName] = rows;
+    statusEl.textContent = `${rows.length.toLocaleString()} rows loaded`;
+    document.getElementById('source-url').textContent =
+      `${GITHUB_OWNER}/${GITHUB_REPO}/${PROFILES[profileName].csvPath}`;
+    return rows;
   } catch (e) {
     statusEl.textContent = 'failed to load data — ' + e.message;
     statusEl.classList.add('err');
     console.error(e);
+    return [];
   }
 }
 
 function parseCSV(text) {
   const lines = text.trim().split('\n');
+  if (lines.length < 2) return []; // header only, no data rows yet
   const headers = lines[0].split(',');
+  const numericFields = new Set([
+    'rank', 'score', 'price',
+    'r1m', 'r3m', 'r6m', 'vol1m',
+    'ret5', 'ret10', 'ret15', 'vol5',
+  ]);
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
     const cells = lines[i].split(',');
     if (cells.length < headers.length) continue;
     const row = {};
-    headers.forEach((h, idx) => row[h.trim()] = cells[idx]);
-    row.rank = parseInt(row.rank, 10);
-    row.score = parseFloat(row.score);
-    row.price = parseFloat(row.price);
-    row.r1m = parseFloat(row.r1m);
-    row.r3m = parseFloat(row.r3m);
-    row.r6m = parseFloat(row.r6m);
-    row.vol1m = parseFloat(row.vol1m);
+    headers.forEach((h, idx) => {
+      const key = h.trim();
+      const val = cells[idx];
+      row[key] = numericFields.has(key)
+        ? (key === 'rank' ? parseInt(val, 10) : parseFloat(val))
+        : val;
+    });
     rows.push(row);
   }
   return rows;
 }
 
+async function ensureProfileLoaded(profileName) {
+  if (rowCache[profileName]) return rowCache[profileName];
+  return loadProfile(profileName);
+}
+
 // ── DATA SHAPING ────────────────────────────────────────
-function buildModel() {
-  const dates = [...new Set(allRows.map(r => r.date))].sort();
+function buildModel(rows) {
+  const dates = [...new Set(rows.map(r => r.date))].sort();
   const cutoffIdx = Math.max(0, dates.length - windowDays);
   const windowDates = dates.slice(cutoffIdx);
   const dateIndex = new Map(windowDates.map((d, i) => [d, i]));
 
   const byDate = new Map();
   windowDates.forEach(d => byDate.set(d, []));
-  for (const r of allRows) {
+  for (const r of rows) {
     if (dateIndex.has(r.date) && r.rank <= topN) {
       byDate.get(r.date).push(r);
     }
@@ -340,8 +389,9 @@ function colorForRunIndex(i) {
 }
 
 // ── RENDER ──────────────────────────────────────────────
-function render() {
-  const { windowDates, dateIndex, runs } = buildModel();
+async function render() {
+  const rows = await ensureProfileLoaded(activeProfile);
+  const { windowDates, dateIndex, runs } = buildModel(rows);
   const svg = document.getElementById('chart');
   const emptyState = document.getElementById('empty-state');
   const rangeLabel = document.getElementById('range-label');
@@ -354,7 +404,8 @@ function render() {
   svg.style.display = 'block';
   emptyState.style.display = 'none';
 
-  rangeLabel.textContent = `${windowDates[0]} → ${windowDates[windowDates.length - 1]} · ${windowDates.length} trading day${windowDates.length > 1 ? 's' : ''}`;
+  const profileLabel = PROFILES[activeProfile].label;
+  rangeLabel.textContent = `${windowDates[0]} → ${windowDates[windowDates.length - 1]} · ${windowDates.length} trading day${windowDates.length > 1 ? 's' : ''} · ${profileLabel}`;
 
   const width = MARGIN.left + MARGIN.right + Math.max(windowDates.length - 1, 0) * COL_W + (windowDates.length === 1 ? COL_W : 0);
   const height = MARGIN.top + MARGIN.bottom + topN * ROW_H;
@@ -404,8 +455,6 @@ function render() {
       svg.appendChild(lbl);
     }
   });
-
-  const tooltip = document.getElementById('tooltip');
 
   runs.forEach((run, runIdx) => {
     const color = colorForRunIndex(runIdx);
@@ -479,14 +528,17 @@ function render() {
 
 function showTooltip(ev, d, isReentry) {
   const tt = document.getElementById('tooltip');
+  const prof = PROFILES[activeProfile];
   const pct = (v) => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  const [ra, rb, rc] = prof.returnFields.map(f => d[f]);
+  const vol = d[prof.volField];
   tt.innerHTML = `
     <span class="sym">${d.symbol} <span style="color:var(--text-dim);font-weight:400;">#${d.rank}</span></span>
     <div class="row"><span class="k">date</span><span>${d.date}</span></div>
     <div class="row"><span class="k">price</span><span>₹${d.price}</span></div>
     <div class="row"><span class="k">score</span><span>${d.score}</span></div>
-    <div class="row"><span class="k">1m / 3m / 6m</span><span>${pct(d.r1m)} / ${pct(d.r3m)} / ${pct(d.r6m)}</span></div>
-    <div class="row"><span class="k">1m vol</span><span>${d.vol1m}</span></div>
+    <div class="row"><span class="k">${prof.tooltipReturnsLabel}</span><span>${pct(ra)} / ${pct(rb)} / ${pct(rc)}</span></div>
+    <div class="row"><span class="k">${prof.volLabel}</span><span>${vol}</span></div>
     ${isReentry ? '<div class="reentry-note">◎ re-entered top ' + topN + '</div>' : ''}
   `;
   tt.style.display = 'block';
@@ -502,6 +554,12 @@ function hideTooltip() {
 }
 
 // ── CONTROLS ────────────────────────────────────────────
+document.getElementById('formula-toggle').addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  activeProfile = e.target.dataset.profile;
+  document.querySelectorAll('#formula-toggle button').forEach(b => b.classList.toggle('active', b === e.target));
+  render();
+});
 document.getElementById('topn-toggle').addEventListener('click', (e) => {
   if (e.target.tagName !== 'BUTTON') return;
   topN = parseInt(e.target.dataset.n, 10);
@@ -515,7 +573,7 @@ document.getElementById('window-toggle').addEventListener('click', (e) => {
   render();
 });
 
-loadData();
+render();
 </script>
 </body>
 </html>

@@ -2,10 +2,16 @@
 NSE Momentum Daily Rank Snapshot — DO Functions Entry Point
 =============================================================
 Runs every trading day before market open. Scores the full watchlist using
-the same momentum formula as the monthly rebalance system, and appends one
-rank snapshot row per stock to a growing history file on GitHub.
+TWO momentum formulas from the same fetched price data, and appends one
+rank snapshot row per stock, per formula, to two growing history files on
+GitHub.
 
-    Score = (1M return + 3M return + 6M return) / 1M volatility
+    Standard : (1M return + 3M return + 6M return) / 1M volatility
+    Short    : (5D return + 10D return + 15D return) / 5D volatility
+
+Both formulas score off the same single Yahoo fetch per symbol — no extra
+API calls for the short formula, it's just a different set of lookback
+windows applied to the same closing-price series.
 
 This job does NOT rebalance, does NOT touch positions, and does NOT affect
 the monthly momentum system in nse-momentum. It exists purely to build a
@@ -38,17 +44,39 @@ from email.mime.text import MIMEText
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-DAYS_1M = 21
-DAYS_3M = 63
-DAYS_6M = 126
-
 SLEEP = 0.3  # seconds between Yahoo Finance calls, same as monthly system
 
 WATCHLIST_FILE = 'data/watchlist.csv'
-HISTORY_FILE   = 'data/rank_history.csv'
 
-HISTORY_FIELDS = ['date', 'symbol', 'rank', 'score', 'price',
-                   'r1m', 'r3m', 'r6m', 'vol1m']
+# Score formula profiles. Both are computed from a single fetched closing
+# price series per symbol — 'windows' are the return lookbacks (summed),
+# 'vol_window' is the lookback for the volatility (std dev of daily
+# returns) denominator.
+PROFILES = {
+    'standard': {
+        'windows': [21, 63, 126],       # ~1M, ~3M, ~6M trading days
+        'vol_window': 21,               # ~1M
+        'history_file': 'data/rank_history.csv',
+        'fields': ['date', 'symbol', 'rank', 'score', 'price',
+                   'r1m', 'r3m', 'r6m', 'vol1m'],
+        'return_keys': ['r1m', 'r3m', 'r6m'],
+        'vol_key': 'vol1m',
+    },
+    'short': {
+        'windows': [5, 10, 15],         # 5D, 10D, 15D
+        'vol_window': 5,                # 5D
+        'history_file': 'data/rank_history_short.csv',
+        'fields': ['date', 'symbol', 'rank', 'score', 'price',
+                   'ret5', 'ret10', 'ret15', 'vol5'],
+        'return_keys': ['ret5', 'ret10', 'ret15'],
+        'vol_key': 'vol5',
+    },
+}
+
+# Need enough bars for the deepest lookback across all profiles, plus a
+# small buffer, or a symbol gets skipped entirely (both formulas).
+MAX_LOOKBACK = max(w for p in PROFILES.values() for w in p['windows'])
+MIN_BARS_REQUIRED = MAX_LOOKBACK + 5
 
 
 # ─────────────────────────────────────────────
@@ -159,57 +187,68 @@ def compute_volatility(closes, lookback_days):
     return variance ** 0.5
 
 
-def score_stock(symbol):
+def score_stock_all_profiles(symbol):
     """
-    Compute momentum score for one stock via a single sequential fetch.
-    Returns dict with score and components, or None on failure.
+    Fetch a symbol's price history ONCE, then score it under every profile
+    in PROFILES using that same series. Returns a dict keyed by profile
+    name -> result dict, omitting any profile that couldn't be scored
+    (e.g. insufficient bars, zero volatility). Returns None if the fetch
+    itself failed or there's not enough history for any profile at all.
     """
     pairs = fetch_closes(symbol, period='1y')
     time.sleep(SLEEP)
-    if not pairs or len(pairs) < DAYS_6M + 5:
+    if not pairs or len(pairs) < MIN_BARS_REQUIRED:
         return None
 
     closes = [c for _, c in pairs]
+    price = closes[-1]
 
-    r1m = compute_return(closes, DAYS_1M)
-    r3m = compute_return(closes, DAYS_3M)
-    r6m = compute_return(closes, DAYS_6M)
-    vol1m = compute_volatility(closes, DAYS_1M)
+    results = {}
+    for profile_name, cfg in PROFILES.items():
+        returns = [compute_return(closes, w) for w in cfg['windows']]
+        vol = compute_volatility(closes, cfg['vol_window'])
+        if any(r is None for r in returns) or vol is None or vol == 0:
+            continue
+        score = sum(returns) / vol
+        row = {
+            'symbol': symbol.strip().upper(),
+            'price': round(price, 2),
+            'score': round(score, 4),
+        }
+        for key, val in zip(cfg['return_keys'], returns):
+            row[key] = round(val, 2)
+        row[cfg['vol_key']] = round(vol, 4)
+        results[profile_name] = row
 
-    if any(v is None for v in [r1m, r3m, r6m, vol1m]) or vol1m == 0:
-        return None
-
-    score = (r1m + r3m + r6m) / vol1m
-    return {
-        'symbol': symbol.strip().upper(),
-        'score': round(score, 4),
-        'price': round(closes[-1], 2),
-        'r1m': round(r1m, 2),
-        'r3m': round(r3m, 2),
-        'r6m': round(r6m, 2),
-        'vol1m': round(vol1m, 4),
-    }
+    return results if results else None
 
 
 def score_universe(symbols):
     """
     Score and rank all stocks sequentially — one Yahoo request at a time,
-    same pattern as the monthly rebalance system's rank_universe().
+    same pattern as the monthly rebalance system's rank_universe(). Scores
+    every profile per symbol from that single fetch, then ranks each
+    profile's list independently (a symbol failing one profile's minimum
+    bar count doesn't block it from the other).
     """
-    print(f'  Scoring {len(symbols)} stocks (sequential)...')
-    scored = []
+    print(f'  Scoring {len(symbols)} stocks (sequential, all profiles per fetch)...')
+    scored = {name: [] for name in PROFILES}
+
     for i, symbol in enumerate(symbols):
-        result = score_stock(symbol)
-        if result:
-            scored.append(result)
+        results = score_stock_all_profiles(symbol)
+        if results:
+            for profile_name, row in results.items():
+                scored[profile_name].append(row)
         if (i + 1) % 50 == 0:
-            print(f'  Progress: {i + 1}/{len(symbols)} scored: {len(scored)}')
+            counts = ', '.join(f'{k}={len(v)}' for k, v in scored.items())
+            print(f'  Progress: {i + 1}/{len(symbols)} — scored so far: {counts}')
 
-    scored.sort(key=lambda x: x['score'], reverse=True)
-    for i, s in enumerate(scored):
-        s['rank'] = i + 1
+    for profile_name, rows in scored.items():
+        rows.sort(key=lambda x: x['score'], reverse=True)
+        for i, s in enumerate(rows):
+            s['rank'] = i + 1
+        print(f'  [{profile_name}] scored {len(rows)}/{len(symbols)} symbols')
 
-    print(f'  Scored {len(scored)}/{len(symbols)} symbols')
     return scored
 
 
@@ -244,7 +283,7 @@ def send_failure_email(error_text):
 
 def main(args):
     print('\n' + '=' * 55)
-    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT')
+    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT (dual formula)')
     print('=' * 55)
 
     pat = os.environ.get('GITHUB_PAT')
@@ -263,42 +302,50 @@ def main(args):
         symbols = [row['Symbol'] for row in watchlist]
         print(f'  Watchlist: {len(symbols)} symbols')
 
-        print('\n[3/4] Scoring universe (sequential fetch)...')
-        ranked = score_universe(symbols)
-        if len(ranked) < 50:
-            msg = f'Only {len(ranked)} stocks scored \u2014 too few, skipping write'
+        print('\n[3/4] Scoring universe (sequential fetch, both formulas)...')
+        scored = score_universe(symbols)
+
+        # Guard each profile independently — if one formula comes up short
+        # (e.g. widespread data gaps for its longer lookback), skip only
+        # that profile's write rather than failing the whole run.
+        write_plan = {}
+        for profile_name, rows in scored.items():
+            if len(rows) < 50:
+                msg = f'[{profile_name}] only {len(rows)} stocks scored \u2014 too few, skipping write'
+                print(f'  WARNING: {msg}')
+                continue
+            write_plan[profile_name] = rows
+
+        if not write_plan:
+            msg = 'No profile had enough scored stocks \u2014 skipping all writes'
             print(f'  ERROR: {msg}')
             send_failure_email(msg)
             return {'statusCode': 500, 'body': msg}
 
-        print('\n[4/4] Appending to rank history on GitHub...')
-        hist_content, hist_sha = github_get(repo_name, HISTORY_FILE, pat)
-        existing_rows = parse_csv(hist_content)
+        print('\n[4/4] Appending to rank history file(s) on GitHub...')
+        total_written = {}
+        for profile_name, rows in write_plan.items():
+            cfg = PROFILES[profile_name]
+            hist_file = cfg['history_file']
+            fields = cfg['fields']
 
-        new_rows = [
-            {
-                'date': today_str,
-                'symbol': s['symbol'],
-                'rank': s['rank'],
-                'score': s['score'],
-                'price': s['price'],
-                'r1m': s['r1m'],
-                'r3m': s['r3m'],
-                'r6m': s['r6m'],
-                'vol1m': s['vol1m'],
-            }
-            for s in ranked
-        ]
+            hist_content, hist_sha = github_get(repo_name, hist_file, pat)
+            existing_rows = parse_csv(hist_content)
 
-        all_rows = existing_rows + new_rows
-        github_put(
-            repo_name, HISTORY_FILE, pat,
-            to_csv(all_rows, HISTORY_FIELDS),
-            hist_sha, f'Rank snapshot \u2014 {today_str} ({len(new_rows)} stocks)'
-        )
+            new_rows = [dict(row, date=today_str) for row in rows]
+            all_rows = existing_rows + new_rows
 
-        print(f'\n  Done. Wrote {len(new_rows)} rows for {today_str}.\n')
-        return {'statusCode': 200, 'body': f'Wrote {len(new_rows)} rows'}
+            github_put(
+                repo_name, hist_file, pat,
+                to_csv(all_rows, fields),
+                hist_sha, f'[{profile_name}] Rank snapshot \u2014 {today_str} ({len(new_rows)} stocks)'
+            )
+            total_written[profile_name] = len(new_rows)
+            print(f'  [{profile_name}] wrote {len(new_rows)} rows to {hist_file}')
+
+        summary = ', '.join(f'{k}={v}' for k, v in total_written.items())
+        print(f'\n  Done. {summary}\n')
+        return {'statusCode': 200, 'body': f'Wrote rows: {summary}'}
 
     except Exception as e:
         error_text = f'{str(e)}\n\n{traceback.format_exc()}'
