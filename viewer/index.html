@@ -2,7 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Momentum Rank Flow</title>
+<meta name="theme-color" content="#0b0f14">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Rank Flow">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -35,7 +44,8 @@
 
   .wrap {
     max-width: 100%;
-    padding: 18px 20px 32px;
+    padding: calc(18px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right))
+             calc(32px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
   }
 
   header {
@@ -112,6 +122,19 @@
     color: #60a5fa;
   }
 
+  .icon-btn {
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1;
+    background: var(--panel);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .icon-btn:hover { color: var(--text); }
+
   .status {
     font-family: var(--mono);
     font-size: 11px;
@@ -160,6 +183,7 @@
     z-index: 50;
     display: none;
     min-width: 170px;
+    max-width: min(300px, calc(100vw - 24px));
   }
 
   .tooltip .sym {
@@ -172,7 +196,8 @@
   }
 
   .tooltip .row { display: flex; justify-content: space-between; gap: 16px; }
-  .tooltip .row .k { color: var(--text-dim); }
+  .tooltip .row .k { color: var(--text-dim); white-space: nowrap; }
+  .tooltip .row .v { text-align: right; }
   .tooltip .reentry-note {
     margin-top: 6px;
     padding-top: 6px;
@@ -202,7 +227,7 @@
     <div class="controls">
       <div class="toggle-group formula" id="formula-toggle">
         <button data-profile="standard" class="active">1M/3M/6M</button>
-        <button data-profile="short">5D/10D/15D</button>
+        <button data-profile="short">10D/15D/1M</button>
       </div>
       <div class="toggle-group" id="topn-toggle">
         <button data-n="25" class="active">TOP 25</button>
@@ -212,6 +237,7 @@
         <button data-days="90" class="active">90D</button>
         <button data-days="180">6M</button>
       </div>
+      <button class="icon-btn" id="refresh-btn" title="Reload data" aria-label="Reload data">&#8635;</button>
       <span class="status" id="status">loading…</span>
     </div>
   </header>
@@ -236,11 +262,13 @@
 // ── CONFIG ──────────────────────────────────────────────
 const GITHUB_OWNER  = 'finnyrajmann';
 const GITHUB_REPO   = 'nse-momentum_ranking';
-const GITHUB_BRANCH = 'main';
+const GITHUB_BRANCH = 'master';
 
 // Both files are written daily by daily_run/__main__.py from the same
 // fetched price data — the DO function computes and persists the rank
 // for each formula, the viewer just picks which file to plot.
+const WATCHLIST_PATH = 'data/watchlist.csv';   // source of each stock's industry (tooltip)
+
 const PROFILES = {
   standard: {
     label: '1M + 3M + 6M / 1M Vol',
@@ -251,17 +279,19 @@ const PROFILES = {
     volField: 'vol1m',
   },
   short: {
-    label: '5D + 10D + 15D / 5D Vol',
-    csvPath: 'data/rank_history_short.csv',
-    tooltipReturnsLabel: '5d / 10d / 15d',
-    volLabel: '5d vol',
-    returnFields: ['ret5', 'ret10', 'ret15'],
-    volField: 'vol5',
+    label: '10D + 15D + 1M / 10D Vol',
+    csvPath: 'data/rank_history_short_v2.csv',
+    tooltipReturnsLabel: '10d / 15d / 1m',
+    volLabel: '10d vol',
+    returnFields: ['ret10', 'ret15', 'ret1m'],
+    volField: 'vol10',
   }
 };
 
 // ── STATE ───────────────────────────────────────────────
 const rowCache = {};       // profile name -> parsed rows (fetched once, cached)
+const industryMap = new Map();   // SYMBOL -> industry (from watchlist.csv)
+let industriesLoaded = false;
 let activeProfile = 'standard';
 let topN = 25;
 let windowDays = 90;
@@ -283,6 +313,14 @@ async function loadProfile(profileName) {
   statusEl.classList.remove('err');
   try {
     const res = await fetch(rawUrlFor(profileName) + '?t=' + Date.now());
+    if (res.status === 404) {
+      // file not created yet (e.g. a new formula before its first run)
+      rowCache[profileName] = [];
+      statusEl.textContent = 'no data yet';
+      document.getElementById('source-url').textContent =
+        `${GITHUB_OWNER}/${GITHUB_REPO}/${PROFILES[profileName].csvPath}`;
+      return [];
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     const rows = parseCSV(text);
@@ -300,13 +338,13 @@ async function loadProfile(profileName) {
 }
 
 function parseCSV(text) {
-  const lines = text.trim().split('\n');
+  const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return []; // header only, no data rows yet
   const headers = lines[0].split(',');
   const numericFields = new Set([
     'rank', 'score', 'price',
     'r1m', 'r3m', 'r6m', 'vol1m',
-    'ret5', 'ret10', 'ret15', 'vol5',
+    'ret10', 'ret15', 'ret1m', 'vol10',
   ]);
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
@@ -323,6 +361,46 @@ function parseCSV(text) {
     rows.push(row);
   }
   return rows;
+}
+
+// Minimal quote-aware CSV line splitter (industry names can contain commas,
+// e.g. "Furnishings, Fixtures & Appliances").
+function splitCSVLine(line) {
+  const out = [];
+  let cur = '', quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else quoted = false;
+      } else cur += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ',') { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+async function ensureIndustries() {
+  if (industriesLoaded) return;
+  try {
+    const url = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${WATCHLIST_PATH}?t=${Date.now()}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const lines = (await res.text()).trim().split(/\r?\n/);
+    const headers = splitCSVLine(lines[0]).map(h => h.trim());
+    const si = headers.indexOf('Symbol'), ii = headers.indexOf('Industry');
+    if (si < 0 || ii < 0) throw new Error('Symbol/Industry columns not found');
+    for (let i = 1; i < lines.length; i++) {
+      const cells = splitCSVLine(lines[i]);
+      const sym = (cells[si] || '').trim().toUpperCase();
+      if (sym) industryMap.set(sym, (cells[ii] || '').trim());
+    }
+    industriesLoaded = true;
+  } catch (e) {
+    console.error('industry lookup unavailable —', e);   // tooltip just shows "—"
+  }
 }
 
 async function ensureProfileLoaded(profileName) {
@@ -390,7 +468,7 @@ function colorForRunIndex(i) {
 
 // ── RENDER ──────────────────────────────────────────────
 async function render() {
-  const rows = await ensureProfileLoaded(activeProfile);
+  const [rows] = await Promise.all([ensureProfileLoaded(activeProfile), ensureIndustries()]);
   const { windowDates, dateIndex, runs } = buildModel(rows);
   const svg = document.getElementById('chart');
   const emptyState = document.getElementById('empty-state');
@@ -495,6 +573,7 @@ async function render() {
       hitArea.addEventListener('mouseenter', (ev) => showTooltip(ev, p.data, run.isReentry && isRunStart));
       hitArea.addEventListener('mousemove', (ev) => positionTooltip(ev));
       hitArea.addEventListener('mouseleave', hideTooltip);
+      hitArea.addEventListener('click', (ev) => showTooltip(ev, p.data, run.isReentry && isRunStart));
       grp.appendChild(hitArea);
 
       // symbol label at the end of each run
@@ -512,6 +591,10 @@ async function render() {
     svg.appendChild(grp);
   });
 
+  // open on the most recent days (matters on a phone, where the chart is wider than the screen)
+  const cont = document.getElementById('chart-container');
+  cont.scrollLeft = cont.scrollWidth;
+
   // dim all, highlight hovered symbol across its runs
   svg.querySelectorAll('.strand').forEach(el => {
     el.addEventListener('mouseenter', () => {
@@ -526,14 +609,20 @@ async function render() {
   });
 }
 
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 function showTooltip(ev, d, isReentry) {
   const tt = document.getElementById('tooltip');
   const prof = PROFILES[activeProfile];
   const pct = (v) => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
   const [ra, rb, rc] = prof.returnFields.map(f => d[f]);
   const vol = d[prof.volField];
+  const industry = industryMap.get(String(d.symbol).toUpperCase()) || '\u2014';
   tt.innerHTML = `
     <span class="sym">${d.symbol} <span style="color:var(--text-dim);font-weight:400;">#${d.rank}</span></span>
+    <div class="row"><span class="k">industry</span><span class="v">${esc(industry)}</span></div>
     <div class="row"><span class="k">date</span><span>${d.date}</span></div>
     <div class="row"><span class="k">price</span><span>₹${d.price}</span></div>
     <div class="row"><span class="k">score</span><span>${d.score}</span></div>
@@ -546,8 +635,13 @@ function showTooltip(ev, d, isReentry) {
 }
 function positionTooltip(ev) {
   const tt = document.getElementById('tooltip');
-  tt.style.left = (ev.clientX + 16) + 'px';
-  tt.style.top = (ev.clientY + 16) + 'px';
+  const pad = 12, gap = 16;
+  const w = tt.offsetWidth, h = tt.offsetHeight;
+  let x = ev.clientX + gap, y = ev.clientY + gap;
+  if (x + w + pad > window.innerWidth)  x = Math.max(pad, ev.clientX - w - gap);
+  if (y + h + pad > window.innerHeight) y = Math.max(pad, ev.clientY - h - gap);
+  tt.style.left = x + 'px';
+  tt.style.top = y + 'px';
 }
 function hideTooltip() {
   document.getElementById('tooltip').style.display = 'none';
@@ -572,6 +666,24 @@ document.getElementById('window-toggle').addEventListener('click', (e) => {
   document.querySelectorAll('#window-toggle button').forEach(b => b.classList.toggle('active', b === e.target));
   render();
 });
+
+document.getElementById('refresh-btn').addEventListener('click', () => {
+  delete rowCache[activeProfile];      // force a fresh download of the active file
+  industriesLoaded = false;
+  render();
+});
+
+// tap anywhere that is not a dot to dismiss the tooltip (touch screens have no mouseleave)
+document.addEventListener('click', (e) => {
+  if (!e.target.closest || !e.target.closest('svg circle')) hideTooltip();
+});
+
+// PWA: offline shell + last-seen data (needs https or localhost)
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(err => console.warn('service worker not registered:', err));
+  });
+}
 
 render();
 </script>
