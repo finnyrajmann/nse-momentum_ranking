@@ -251,7 +251,7 @@
   </div>
 
   <footer>
-    source: <span id="source-url"></span> · re-entry marker (◎) = stock re-appeared in the ranked window after dropping out
+    source: <span id="source-url"></span> · re-entry marker (◎) = stock re-appeared in the ranked window after dropping out · top row: market trend dot (SuperTrend 10,3 — green/red when more than 50% of the watchlist is up/down) with stocks up ▲ / down ▼
   </footer>
 
 </div>
@@ -268,6 +268,7 @@ const GITHUB_BRANCH = 'master';
 // fetched price data — the DO function computes and persists the rank
 // for each formula, the viewer just picks which file to plot.
 const WATCHLIST_PATH = 'data/watchlist.csv';   // source of each stock's industry (tooltip)
+const TREND_PATH = 'data/market_trend.csv';     // daily market trend (SuperTrend majority vote)
 
 const PROFILES = {
   standard: {
@@ -292,13 +293,15 @@ const PROFILES = {
 const rowCache = {};       // profile name -> parsed rows (fetched once, cached)
 const industryMap = new Map();   // SYMBOL -> industry (from watchlist.csv)
 let industriesLoaded = false;
+const trendMap = new Map();      // run date -> {trend, up, down, total, pct_up, session_date}
+let trendLoaded = false;
 let activeProfile = 'standard';
 let topN = 25;
 let windowDays = 90;
 
 const ROW_H = 22;        // vertical px per rank slot
 const COL_W = 46;        // horizontal px per trading day
-const MARGIN = { top: 24, right: 90, bottom: 34, left: 34 };
+const MARGIN = { top: 64, right: 90, bottom: 14, left: 34 };   // top holds the date / trend header
 const GOLDEN_ANGLE = 137.508;
 
 // ── FETCH + PARSE ───────────────────────────────────────
@@ -403,6 +406,37 @@ async function ensureIndustries() {
   }
 }
 
+function parseTrendCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim());
+  const numeric = new Set(['up', 'down', 'total', 'pct_up']);
+  return lines.slice(1).filter(l => l.trim()).map(line => {
+    const cells = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => {
+      const v = (cells[i] ?? '').trim();
+      row[h] = numeric.has(h) ? parseFloat(v) : v;
+    });
+    return row;
+  });
+}
+
+async function ensureTrend() {
+  if (trendLoaded) return;
+  try {
+    const url = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${TREND_PATH}?t=${Date.now()}`;
+    const res = await fetch(url);
+    if (res.status === 404) { trendLoaded = true; return; }      // not created yet — no dots
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    trendMap.clear();
+    parseTrendCSV(await res.text()).forEach(r => { if (r.date) trendMap.set(r.date, r); });
+    trendLoaded = true;
+  } catch (e) {
+    console.error('market trend unavailable —', e);               // chart still renders without dots
+  }
+}
+
 async function ensureProfileLoaded(profileName) {
   if (rowCache[profileName]) return rowCache[profileName];
   return loadProfile(profileName);
@@ -468,7 +502,7 @@ function colorForRunIndex(i) {
 
 // ── RENDER ──────────────────────────────────────────────
 async function render() {
-  const [rows] = await Promise.all([ensureProfileLoaded(activeProfile), ensureIndustries()]);
+  const [rows] = await Promise.all([ensureProfileLoaded(activeProfile), ensureIndustries(), ensureTrend()]);
   const { windowDates, dateIndex, runs } = buildModel(rows);
   const svg = document.getElementById('chart');
   const emptyState = document.getElementById('empty-state');
@@ -520,18 +554,52 @@ async function render() {
     }
   }
 
-  // date axis labels (sparse, avoid clutter)
+  // ── header: dates, market-trend dot, stocks up / down ──
   const labelEvery = Math.max(1, Math.ceil(windowDates.length / 14));
+  const Y_DATE = 12, Y_DOT = 27, Y_UP = 42, Y_DOWN = 53, Y_RULE = 60;
+  const trendColor = (t) => t === 'UP' ? 'var(--up)' : t === 'DOWN' ? 'var(--down)' : 'var(--text-dim)';
+
+  svg.appendChild(g('line', {
+    x1: MARGIN.left, x2: width - MARGIN.right, y1: Y_RULE, y2: Y_RULE,
+    stroke: 'var(--grid)', 'stroke-width': 1
+  }));
+  [['\u25B2', Y_UP, 'var(--up)'], ['\u25BC', Y_DOWN, 'var(--down)']].forEach(([glyph, y, color]) => {
+    const t = g('text', { x: 10, y, fill: color, 'font-family': 'var(--mono)', 'font-size': 9, opacity: 0.8 });
+    t.textContent = glyph;
+    svg.appendChild(t);
+  });
+
   windowDates.forEach((d, i) => {
+    const x = xFor(i);
     if (i % labelEvery === 0 || i === windowDates.length - 1) {
       const lbl = g('text', {
-        x: xFor(i), y: height - 12,
+        x, y: Y_DATE,
         fill: 'var(--text-faint)', 'font-family': 'var(--mono)', 'font-size': 10,
         'text-anchor': 'middle'
       });
       lbl.textContent = d.slice(5); // MM-DD
       svg.appendChild(lbl);
     }
+    const t = trendMap.get(d);
+    if (!t) return;
+    svg.appendChild(g('circle', { cx: x, cy: Y_DOT, r: 5, fill: trendColor(t.trend) }));
+    [[t.up, Y_UP, 'var(--up)'], [t.down, Y_DOWN, 'var(--down)']].forEach(([count, y, color]) => {
+      const c = g('text', {
+        x, y, fill: color, 'font-family': 'var(--mono)', 'font-size': 9,
+        'text-anchor': 'middle', opacity: 0.85
+      });
+      c.textContent = count;
+      svg.appendChild(c);
+    });
+    const hit = g('rect', {
+      class: 'trend-hit', x: x - COL_W / 2, y: 18, width: COL_W, height: 40, fill: 'transparent',
+      style: 'cursor: default;'
+    });
+    hit.addEventListener('mouseenter', (ev) => showTrendTooltip(ev, d, t));
+    hit.addEventListener('mousemove', positionTooltip);
+    hit.addEventListener('mouseleave', hideTooltip);
+    hit.addEventListener('click', (ev) => showTrendTooltip(ev, d, t));
+    svg.appendChild(hit);
   });
 
   runs.forEach((run, runIdx) => {
@@ -633,6 +701,21 @@ function showTooltip(ev, d, isReentry) {
   tt.style.display = 'block';
   positionTooltip(ev);
 }
+function showTrendTooltip(ev, date, t) {
+  const tt = document.getElementById('tooltip');
+  const col = t.trend === 'UP' ? 'var(--up)' : t.trend === 'DOWN' ? 'var(--down)' : 'var(--text-dim)';
+  tt.innerHTML = `
+    <span class="sym">Market trend <span style="color:${col};font-weight:600;">${esc(t.trend)}</span></span>
+    <div class="row"><span class="k">date</span><span>${esc(date)}</span></div>
+    <div class="row"><span class="k">as of close</span><span>${esc(t.session_date)}</span></div>
+    <div class="row"><span class="k">stocks up</span><span style="color:var(--up)">${t.up}</span></div>
+    <div class="row"><span class="k">stocks down</span><span style="color:var(--down)">${t.down}</span></div>
+    <div class="row"><span class="k">% up</span><span>${t.pct_up}% of ${t.total}</span></div>
+    <div style="margin-top:6px;color:var(--text-faint);font-size:10px;">SuperTrend (10, 3) · majority of watchlist</div>
+  `;
+  tt.style.display = 'block';
+  positionTooltip(ev);
+}
 function positionTooltip(ev) {
   const tt = document.getElementById('tooltip');
   const pad = 12, gap = 16;
@@ -670,12 +753,13 @@ document.getElementById('window-toggle').addEventListener('click', (e) => {
 document.getElementById('refresh-btn').addEventListener('click', () => {
   delete rowCache[activeProfile];      // force a fresh download of the active file
   industriesLoaded = false;
+  trendLoaded = false;
   render();
 });
 
 // tap anywhere that is not a dot to dismiss the tooltip (touch screens have no mouseleave)
 document.addEventListener('click', (e) => {
-  if (!e.target.closest || !e.target.closest('svg circle')) hideTooltip();
+  if (!e.target.closest || !e.target.closest('svg circle, svg .trend-hit')) hideTooltip();
 });
 
 // PWA: offline shell + last-seen data (needs https or localhost)
