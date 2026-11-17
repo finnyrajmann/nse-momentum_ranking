@@ -45,6 +45,12 @@ Behaviour notes
   One row per day goes to data/market_trend.csv: date (run date, like the
   rank files), session_date (the market session the data is as of — use this
   to join against trade logs), trend, up, down, total, pct_up.
+- Completed sessions only: every bar dated on or after the run date (IST) is
+  dropped before anything is computed. At 08:50 IST that normally changes
+  nothing, but a placeholder/stub bar for "today" (or a live intraday bar on a
+  manual run) can never leak into the ranks or the trend. The log says how many
+  stocks had such a bar ignored, and trend emails carry a per-stock breakdown
+  of the latest bar dates so a coverage problem explains itself.
 - Invoke with {"dry_run": true} to do everything except write to GitHub
   (emails are prefixed [DRY RUN]); {"force": true} runs on a non-session day.
 
@@ -75,7 +81,6 @@ RETRY_SLEEP = 2.0           # pause before retrying a plain failure
 RATE_LIMIT_SLEEP = 6.0      # pause before retrying an HTTP 429
 
 IST = timezone(timedelta(hours=5, minutes=30))
-BAR_FINAL_HOUR_IST = 16     # today's daily bar counts as complete only after this hour (IST)
 
 WATCHLIST_FILE = 'data/watchlist.csv'
 HOLIDAY_FILE = 'data/nse_holidays.csv'
@@ -244,14 +249,6 @@ def prev_trading_day(d):
     return d
 
 
-def last_completed_session(now_ist):
-    """Most recent session whose daily bar should be final at now_ist."""
-    d = now_ist.date()
-    if is_trading_day(d) and now_ist.hour >= BAR_FINAL_HOUR_IST:
-        return d
-    return prev_trading_day(d)
-
-
 def calendar_notices(today):
     notes = []
     if not CALENDAR_OK:
@@ -306,12 +303,18 @@ def fetch_closes(symbol, period='1y'):
     return fetch_chart(symbol.upper().strip() + '.NS', period)
 
 
-def fetch_ref_date():
-    """Newest bar date on ^NSEI (IST) — used only as a cross-check of the calendar."""
+def fetch_ref_date(before=None):
+    """
+    Newest completed-session bar date on ^NSEI (IST), ignoring bars dated on or
+    after `before` — used only as a cross-check of the calendar.
+    """
     pairs = fetch_chart('^NSEI', '5d')
     if not pairs:
         return None
-    return datetime.fromtimestamp(pairs[-1][0], IST).date()
+    dates = [bar_date(p[0]) for p in pairs]
+    if before is not None:
+        dates = [d for d in dates if d < before]
+    return max(dates) if dates else None
 
 
 # ─────────────────────────────────────────────
@@ -434,25 +437,35 @@ def compute_volatility(closes, lookback_days):
     return variance ** 0.5
 
 
-def score_stock_all_profiles(symbol):
+def score_stock_all_profiles(symbol, before=None):
     """
     Fetch a symbol's price history ONCE, then score it under every profile
     in PROFILES using that same series, and read its SuperTrend direction
-    for the market trend. Returns (results, trend, reason): results is a
-    dict profile name -> row (profiles the symbol is too short for, or that
-    have zero volatility, are omitted) or None; trend is (bar_date,
-    direction) or None; reason is 'fetch_failed' / 'insufficient_data' when
-    results is None.
+    for the market trend. Bars dated on or after `before` are ignored.
+    Returns (results, trend, reason, info): results is a dict profile name ->
+    row (profiles the symbol is too short for, or that have zero volatility,
+    are omitted) or None; trend is (bar_date, direction) or None; reason is
+    'fetch_failed' / 'insufficient_data' when results is None; info describes
+    the data (last_close date, how many bars were ignored, whether the last
+    bar lacked high/low) for diagnostics.
     """
+    info = {'last_close': None, 'dropped': 0, 'hl_missing': False}
     bars = fetch_closes(symbol, period='1y')
     time.sleep(SLEEP)
     if bars is None:
-        return None, None, 'fetch_failed'
+        return None, None, 'fetch_failed', info
+
+    if before is not None:
+        kept = [b for b in bars if bar_date(b[0]) < before]
+        info['dropped'] = len(bars) - len(kept)
+        bars = kept
 
     closes = [b[3] for b in bars]
     if not closes:
-        return None, None, 'insufficient_data'
+        return None, None, 'insufficient_data', info
     price = closes[-1]
+    info['last_close'] = bar_date(bars[-1][0])
+    info['hl_missing'] = bars[-1][1] is None or bars[-1][2] is None
 
     trend = None
     if len(bars) >= ST_MIN_BARS:
@@ -480,31 +493,39 @@ def score_stock_all_profiles(symbol):
         results[profile_name] = row
 
     if not results:
-        return None, trend, 'insufficient_data'
-    return results, trend, None
+        return None, trend, 'insufficient_data', info
+    return results, trend, None, info
 
 
-def score_universe(symbols):
+def score_universe(symbols, before=None):
     """
     Score and rank all stocks sequentially — one Yahoo request at a time.
     Every profile is scored per symbol from that single fetch, then each
     profile's list is ranked independently (a symbol that is too new for the
     standard formula can still be ranked on the short one).
 
-    Returns (scored, missing, trends): scored[profile] is the ranked row
+    Returns (scored, missing, trends, diag): scored[profile] is the ranked row
     list; missing[profile] lists the symbols that did not score, by reason;
-    trends is the list of (bar_date, direction) SuperTrend readings.
+    trends is the list of (bar_date, direction) SuperTrend readings; diag holds
+    per-stock data facts (latest SuperTrend date, ignored-bar and missing
+    high/low flags) used to explain trend-coverage problems.
     """
     print(f'  Scoring {len(symbols)} stocks (sequential, all profiles per fetch)...')
     scored = {name: [] for name in PROFILES}
     missing = {name: {'fetch_failed': [], 'insufficient_data': []} for name in PROFILES}
     trends = []
+    diag = {'trend_date': {}, 'dropped': [], 'hl_missing': []}
 
     for i, symbol in enumerate(symbols):
-        results, trend, reason = score_stock_all_profiles(symbol)
+        results, trend, reason, info = score_stock_all_profiles(symbol, before)
         if trend is not None:
             trends.append(trend)
         sym = symbol.strip().upper()
+        diag['trend_date'][sym] = trend[0] if trend else None
+        if info['dropped']:
+            diag['dropped'].append(sym)
+        if info['hl_missing']:
+            diag['hl_missing'].append(sym)
         for name in PROFILES:
             if results and name in results:
                 scored[name].append(results[name])
@@ -522,7 +543,24 @@ def score_universe(symbols):
         print(f'  [{profile_name}] scored {len(rows)}/{len(symbols)} symbols '
               f'(fetch failed: {len(m["fetch_failed"])}, too little history: {len(m["insufficient_data"])})')
 
-    return scored, missing, trends
+    return scored, missing, trends, diag
+
+
+def describe_trend_gap(diag, session_iso, limit=8):
+    """One-line breakdown of where each stock's latest SuperTrend reading falls."""
+    labels = {s: (d.isoformat() if d else 'none') for s, d in diag['trend_date'].items()}
+    counts = Counter(labels.values())
+    parts = ['latest SuperTrend date per stock \u2014 '
+             + ', '.join(f'{k}: {v}' for k, v in sorted(counts.items(), reverse=True))]
+    off = [s for s, lab in labels.items() if lab != session_iso]
+    if off:
+        parts.append('off-session examples: ' + ', '.join(f'{s} ({labels[s]})' for s in off[:limit]))
+    if diag['dropped']:
+        parts.append(f"bars dated today or later ignored for {len(diag['dropped'])} stocks")
+    if diag['hl_missing']:
+        parts.append(f"latest bar had no high/low for {len(diag['hl_missing'])} stocks "
+                     f"(e.g. {', '.join(diag['hl_missing'][:limit])})")
+    return ' | '.join(parts)
 
 
 def describe_missing(m, limit=15):
@@ -672,8 +710,8 @@ def main(args):
                 send_notice_email(notices, dry_run)
             return {'statusCode': 200, 'body': f'{reason}: skipped'}
 
-        ref_date = last_completed_session(now_ist)
-        nifty_date = fetch_ref_date()
+        ref_date = prev_trading_day(today)       # the job always works "as of the previous session"
+        nifty_date = fetch_ref_date(today)
         print(f'  Last completed session (calendar): {ref_date} | NIFTY newest bar: {nifty_date}')
         if nifty_date and nifty_date != ref_date:
             nifty_flagged = True
@@ -689,8 +727,13 @@ def main(args):
         print(f'  Watchlist: {len(symbols)} symbols')
 
         print('\n[3/5] Scoring universe (sequential fetch, both formulas)...')
-        scored, missing, trends = score_universe(symbols)
+        scored, missing, trends, diag = score_universe(symbols, today)
         summary = summarize_market_trend(trends)
+        if diag['dropped']:
+            print(f"  Ignored bars dated {today} or later for {len(diag['dropped'])} stock(s)")
+        session_iso = summary['session_date'] if summary else None
+        trend_gap = describe_trend_gap(diag, session_iso)
+        print(f'  Trend data: {trend_gap}')
 
         # Guard each profile independently.
         problems = []
@@ -710,18 +753,18 @@ def main(args):
 
         # Market trend: written as one row per day, guarded like the profiles.
         if summary is None:
-            problems.append('[trend] SuperTrend could not be computed for any stock \u2014 write skipped.')
+            problems.append(f'[trend] SuperTrend could not be computed for any stock \u2014 write skipped. {trend_gap}')
         else:
             tfrac = summary['total'] / n if n else 0.0
             print(f"  Market trend: {summary['trend']} \u2014 {summary['up']} up / {summary['down']} down "
                   f"of {summary['total']} ({summary['pct_up']}% up), session {summary['session_date']}")
             if tfrac < MIN_SCORED_FRACTION:
                 problems.append(f"[trend] SuperTrend available for only {summary['total']}/{n} stocks "
-                                f"({tfrac:.0%}) \u2014 below {MIN_SCORED_FRACTION:.0%}, write skipped.")
+                                f"({tfrac:.0%}) \u2014 below {MIN_SCORED_FRACTION:.0%}, write skipped. {trend_gap}")
             else:
                 if tfrac < WARN_SCORED_FRACTION:
                     notices.append(f"[trend] SuperTrend available for {summary['total']}/{n} stocks "
-                                   f"({tfrac:.0%}) \u2014 below the {WARN_SCORED_FRACTION:.0%} warning level.")
+                                   f"({tfrac:.0%}) \u2014 below the {WARN_SCORED_FRACTION:.0%} warning level. {trend_gap}")
                 write_plan['trend'] = [summary]
             if summary['session_date'] != ref_date.isoformat() and not nifty_flagged:
                 notices.append(f"Most stocks' latest bar is {summary['session_date']} but the calendar "
