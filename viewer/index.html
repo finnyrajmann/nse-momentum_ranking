@@ -135,6 +135,20 @@
   }
   .icon-btn:hover { color: var(--text); }
 
+  .run-status {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    white-space: nowrap;
+    cursor: default;
+  }
+  .run-status.ok   { color: var(--up);     border-color: rgba(74, 222, 128, 0.35); }
+  .run-status.warn { color: var(--accent); border-color: rgba(240, 169, 74, 0.45); }
+  .run-status.bad  { color: var(--down);   border-color: rgba(248, 113, 113, 0.5); }
+
   .status {
     font-family: var(--mono);
     font-size: 11px;
@@ -238,6 +252,7 @@
         <button data-days="180">6M</button>
       </div>
       <button class="icon-btn" id="refresh-btn" title="Reload data" aria-label="Reload data">&#8635;</button>
+      <span class="run-status" id="run-status" style="display:none;"></span>
       <span class="status" id="status">loading…</span>
     </div>
   </header>
@@ -269,6 +284,7 @@ const GITHUB_BRANCH = 'master';
 // for each formula, the viewer just picks which file to plot.
 const WATCHLIST_PATH = 'data/watchlist.csv';   // source of each stock's industry (tooltip)
 const TREND_PATH = 'data/market_trend.csv';     // daily market trend (SuperTrend majority vote)
+const STATUS_PATH = 'data/run_status.json';     // outcome of the latest daily run
 
 const PROFILES = {
   standard: {
@@ -406,6 +422,39 @@ async function ensureIndustries() {
   }
 }
 
+// ── run status: did the daily job run, and how? (no email needed) ──
+async function loadRunStatus() {
+  const el = document.getElementById('run-status');
+  try {
+    const url = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${STATUS_PATH}?t=${Date.now()}`;
+    const res = await fetch(url);
+    if (res.status === 404) { el.style.display = 'none'; return; }     // job has not written one yet
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const st = await res.json();
+    const runDay = new Date(st.run_date + 'T00:00:00');
+    const ageDays = Math.floor((Date.now() - runDay.getTime()) / 86400000);
+    let cls = 'ok', text = `\u25CF last run ${st.run_date}`;
+    if (st.outcome === 'failed')       { cls = 'bad';  text = `\u2715 run failed ${st.run_date}`; }
+    else if (ageDays > 4)              { cls = 'bad';  text = `\u2715 no run since ${st.run_date}`; }
+    else if (st.outcome === 'warning') { cls = 'warn'; text = `\u25B2 run warning ${st.run_date}`; }
+    else if (st.outcome === 'skipped') { text = `\u25CF ${st.run_date} skipped`; }
+    const lines = [];
+    if (st.message) lines.push(st.message);
+    if (st.wrote && Object.keys(st.wrote).length) lines.push('wrote: ' + Object.entries(st.wrote).map(([k, v]) => `${k} ${v}`).join(', '));
+    if (st.reconciled && Object.keys(st.reconciled).length) lines.push('corrected earlier days: ' + Object.entries(st.reconciled).map(([k, v]) => `${k} ${v.join(' ')}`).join(' | '));
+    if (st.provisional && st.provisional.length) lines.push('latest day is provisional (Yahoo data still filling in): ' + st.provisional.join(', '));
+    if (st.pending && st.pending.length) lines.push('earlier days still filling in: ' + st.pending.join(', '));
+    if (st.finished_at) lines.push('finished ' + st.finished_at);
+    el.className = 'run-status ' + cls;
+    el.textContent = text;
+    el.title = lines.join('\n');
+    el.style.display = '';
+  } catch (e) {
+    console.error('run status unavailable —', e);
+    el.style.display = 'none';
+  }
+}
+
 function parseTrendCSV(text) {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return [];
@@ -502,7 +551,7 @@ function colorForRunIndex(i) {
 
 // ── RENDER ──────────────────────────────────────────────
 async function render() {
-  const [rows] = await Promise.all([ensureProfileLoaded(activeProfile), ensureIndustries(), ensureTrend()]);
+  const [rows] = await Promise.all([ensureProfileLoaded(activeProfile), ensureIndustries(), ensureTrend(), loadRunStatus()]);
   const { windowDates, dateIndex, runs } = buildModel(rows);
   const svg = document.getElementById('chart');
   const emptyState = document.getElementById('empty-state');

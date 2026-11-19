@@ -2,57 +2,64 @@
 NSE Momentum Daily Rank Snapshot — DO Functions Entry Point
 =============================================================
 Runs every trading day before market open. Scores the full watchlist using
-TWO momentum formulas from the same fetched price data, and appends one
-rank snapshot row per stock, per formula, to two growing history files on
+TWO momentum formulas from the same fetched price data, records a daily
+market trend, and appends one snapshot per day to growing history files on
 GitHub.
 
     Standard : (1M return + 3M return + 6M return) / 1M volatility
     Short    : (10D return + 15D return + 1M return) / 10D volatility
+    Trend    : SuperTrend (ATR 10, x3, Wilder) of every watchlist stock;
+               UP/DOWN when more than 50% of stocks agree (NEUTRAL on a tie)
 
-Both formulas score off the same single Yahoo fetch per symbol — no extra
-API calls for the short formula, it's just a different set of lookback
-windows applied to the same closing-price series.
+All of it comes from ONE Yahoo fetch per symbol (1 year of daily bars).
+This job does NOT rebalance and does NOT touch positions.
 
-This job does NOT rebalance, does NOT touch positions, and does NOT affect
-the monthly momentum system in nse-momentum. It exists purely to build a
-day-by-day rank history for the bump-chart visualization.
+Files (all under data/ in the GitHub repo)
+------------------------------------------
+  rank_history.csv, rank_history_short_v2.csv   one block of rows per run date
+  market_trend.csv   date (run date), session_date (the market session the
+                     numbers are as of - use this to join against trade logs),
+                     trend, up, down, total, pct_up
+  nse_holidays.csv   trading calendar (Date,Type,Description)
+  run_status.json    outcome of the latest run, read by the viewer
 
-Behaviour notes
----------------
-- Trading calendar: data/nse_holidays.csv (Date,Type,Description; Type is
-  HOLIDAY or COVERS_THROUGH) — the same explicit-list method used by the
-  nse-bb_ema_cross system. A day is a session if it is Mon-Fri and not a
-  listed holiday; non-session days are skipped quietly. If the calendar is
-  missing/expired/about to expire, or disagrees with NIFTY's newest bar, a
-  short notice email is sent. If it cannot be loaded at all, the job falls
-  back to weekday-only and says so in the notice.
-- History files are APPENDED to, never rebuilt: the new file text is always
-  (existing text + new rows). The existing text is read in full (raw media
-  type, so files over GitHub's 1 MiB JSON limit work) and its byte length is
-  verified against GitHub's reported size, so a truncated/empty read can
-  never turn into an overwrite.
-- Guards per history file: header must match the expected schema; if the
-  file's last date is already today (or later) the write is skipped; a file
-  that does not exist yet is created with a header.
-- Alerting: failure email on any error; a warning notice when fewer than 95%
-  of the watchlist scores for a profile; the profile's write is skipped (and
-  a failure email sent) when fewer than 80% scores. A failed write for one
-  profile does not stop the other.
-- Market trend: from the same Yahoo fetch (highs/lows/closes) every stock's
-  SuperTrend (ATR 10, multiplier 3, Wilder smoothing — TradingView's
-  ta.supertrend) is evaluated; the day's market trend is UP/DOWN when more
-  than 50% of the watchlist's stocks are up/down (NEUTRAL on an exact tie).
-  One row per day goes to data/market_trend.csv: date (run date, like the
-  rank files), session_date (the market session the data is as of — use this
-  to join against trade logs), trend, up, down, total, pct_up.
-- Completed sessions only: every bar dated on or after the run date (IST) is
-  dropped before anything is computed. At 08:50 IST that normally changes
-  nothing, but a placeholder/stub bar for "today" (or a live intraday bar on a
-  manual run) can never leak into the ranks or the trend. The log says how many
-  stocks had such a bar ignored, and trend emails carry a per-stock breakdown
-  of the latest bar dates so a coverage problem explains itself.
-- Invoke with {"dry_run": true} to do everything except write to GitHub
-  (emails are prefixed [DRY RUN]); {"force": true} runs on a non-session day.
+Run dates and sessions
+----------------------
+A run on date D (before the open) works "as of the previous session": every
+bar dated on or after D is ignored, so a placeholder or live intraday bar can
+never leak in. The expected session is the previous trading day per the holiday
+calendar.
+
+Yahoo's lag and the reconcile step
+----------------------------------
+Yahoo often has no data yet for the previous session on a third or more of
+the stocks at 08:50 IST (rows exist but all values are empty); it fills in
+later the same day. So every run does two things:
+  1. records today's rows as before (rank rows are provisional; the trend row is
+     written only if at least 95% of stocks have a bar for the expected session,
+     otherwise it is deferred), and
+  2. RECONCILES the last few run dates (default 3): each date whose expected
+     session is now complete (>= 95% of stocks) is re-scored from the bars just
+     fetched, and its rows are replaced in place if they differ (missing trend
+     rows are inserted). Dates that are still incomplete are left alone.
+  Nothing outside that window is touched; untouched rows stay byte-identical;
+  a replaced block may not change size by more than 10%; the header must match.
+
+Alert policy (no news is good news)
+-----------------------------------
+Lag, provisional rows, deferred trend rows and reconcile updates are logged,
+never emailed. An email goes out only for real problems: an exception; a
+failed or refused write (schema mismatch, size guard); Yahoo returning data for
+fewer than 80% of the watchlist; fewer than 80% of stocks scoring for a formula;
+a run date that is STILL incomplete when it is about to age out of the window;
+and calendar problems (missing / expired / ending within 14 days, or NIFTY and
+the stocks both disagreeing with the calendar). Every run also writes
+data/run_status.json (outcome ok / warning / failed / skipped) so the viewer can
+show whether the job ran, and how, without any email.
+
+Invoke with {"dry_run": true} to do everything except write to GitHub, and
+{"force": true} to run on a non-session day. {"reconcile_days": 80} widens the
+reconcile window (one-off repair of history); 0 turns reconcile off.
 
 No pip installs needed — requests + standard library only.
 """
@@ -60,6 +67,8 @@ No pip installs needed — requests + standard library only.
 import os
 import csv
 import re
+import json
+import bisect
 import time
 import base64
 import smtplib
@@ -84,10 +93,16 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 WATCHLIST_FILE = 'data/watchlist.csv'
 HOLIDAY_FILE = 'data/nse_holidays.csv'
+STATUS_FILE = 'data/run_status.json'
 
-# Share of the watchlist that must score for a profile to be written.
-WARN_SCORED_FRACTION = 0.95   # below this: still write, but send a notice
+# Share of the watchlist that must have data / score for a write to go ahead.
 MIN_SCORED_FRACTION = 0.80    # below this: skip the write and send a failure alert
+# Share of stocks that must have a bar for a session before its rows are final.
+READY_FRACTION = 0.95
+
+RECONCILE_DAYS = 3            # how many past run dates each run re-checks
+MAX_DAILY_WINDOW = 10         # a window wider than this is a one-off repair, not the daily routine
+BLOCK_TOLERANCE = 0.10        # a replaced day's row count may change by at most this share
 
 BAR_BUFFER = 5              # extra bars required beyond the deepest lookback
 
@@ -100,6 +115,7 @@ TREND_CFG = {
     'fields': ['date', 'session_date', 'trend', 'up', 'down', 'total', 'pct_up'],
     'label': 'Market trend',
     'unit': 'row',
+    'insert_missing': True,   # reconcile may add a trend row for a run date that has none
 }
 
 # Score formula profiles. Both are computed from a single fetched closing
@@ -131,6 +147,9 @@ PROFILES = {
 
 for _cfg in PROFILES.values():
     _cfg['min_bars'] = max(_cfg['windows'] + [_cfg['vol_window']]) + BAR_BUFFER
+
+TARGETS = dict(PROFILES)
+TARGETS['trend'] = TREND_CFG
 
 
 # ─────────────────────────────────────────────
@@ -269,8 +288,9 @@ def calendar_notices(today):
 def fetch_chart(ticker, period='1y'):
     """
     Fetch daily bars for a Yahoo ticker. Returns a list of (timestamp, high,
-    low, close), oldest first, for bars that have a close — or None. One retry on errors / rate limits / server errors; an
-    HTTP 404 (unknown ticker) is not retried.
+    low, close), oldest first, for bars that have a close — or None. Rows whose
+    values are all empty (Yahoo's lag) are dropped. One retry on errors / rate
+    limits / server errors; an HTTP 404 (unknown ticker) is not retried.
     """
     url = f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}'
     params = {'range': period, 'interval': '1d', 'events': 'history'}
@@ -437,24 +457,18 @@ def compute_volatility(closes, lookback_days):
     return variance ** 0.5
 
 
-def score_stock_all_profiles(symbol, before=None):
+def score_bars(symbol, bars, before=None):
     """
-    Fetch a symbol's price history ONCE, then score it under every profile
-    in PROFILES using that same series, and read its SuperTrend direction
-    for the market trend. Bars dated on or after `before` are ignored.
+    Score one symbol from bars already fetched, under every profile, and read
+    its SuperTrend direction. Bars dated on or after `before` are ignored.
     Returns (results, trend, reason, info): results is a dict profile name ->
     row (profiles the symbol is too short for, or that have zero volatility,
     are omitted) or None; trend is (bar_date, direction) or None; reason is
-    'fetch_failed' / 'insufficient_data' when results is None; info describes
-    the data (last_close date, how many bars were ignored, whether the last
-    bar lacked high/low) for diagnostics.
+    'insufficient_data' when results is None; info describes the data
+    (last_close date, how many bars were ignored, whether the last bar lacked
+    high/low) for diagnostics.
     """
     info = {'last_close': None, 'dropped': 0, 'hl_missing': False}
-    bars = fetch_closes(symbol, period='1y')
-    time.sleep(SLEEP)
-    if bars is None:
-        return None, None, 'fetch_failed', info
-
     if before is not None:
         kept = [b for b in bars if bar_date(b[0]) < before]
         info['dropped'] = len(bars) - len(kept)
@@ -497,30 +511,59 @@ def score_stock_all_profiles(symbol, before=None):
     return results, trend, None, info
 
 
-def score_universe(symbols, before=None):
-    """
-    Score and rank all stocks sequentially — one Yahoo request at a time.
-    Every profile is scored per symbol from that single fetch, then each
-    profile's list is ranked independently (a symbol that is too new for the
-    standard formula can still be ranked on the short one).
+def score_stock_all_profiles(symbol, before=None):
+    """Fetch one symbol and score it (see score_bars). reason 'fetch_failed' on a failed fetch."""
+    bars = fetch_closes(symbol, period='1y')
+    time.sleep(SLEEP)
+    if bars is None:
+        return None, None, 'fetch_failed', {'last_close': None, 'dropped': 0, 'hl_missing': False}
+    return score_bars(symbol, bars, before)
 
-    Returns (scored, missing, trends, diag): scored[profile] is the ranked row
-    list; missing[profile] lists the symbols that did not score, by reason;
-    trends is the list of (bar_date, direction) SuperTrend readings; diag holds
-    per-stock data facts (latest SuperTrend date, ignored-bar and missing
-    high/low flags) used to explain trend-coverage problems.
+
+def fetch_universe(symbols):
+    """One sequential Yahoo fetch per symbol. Returns (bars_by_symbol, fetch_failed)."""
+    print(f'  Fetching {len(symbols)} stocks (sequential, 1y of daily bars each)...')
+    bars_by_symbol, fetch_failed = {}, []
+    for i, symbol in enumerate(symbols):
+        sym = symbol.strip().upper()
+        bars = fetch_closes(sym, period='1y')
+        time.sleep(SLEEP)
+        if bars is None:
+            fetch_failed.append(sym)
+        else:
+            bars_by_symbol[sym] = bars
+        if (i + 1) % 50 == 0:
+            print(f'  Progress: {i + 1}/{len(symbols)} (fetch failed so far: {len(fetch_failed)})')
+    return bars_by_symbol, fetch_failed
+
+
+def evaluate_asof(symbols, bars_by_symbol, fetch_failed, before):
     """
-    print(f'  Scoring {len(symbols)} stocks (sequential, all profiles per fetch)...')
+    Score and rank every stock as the run on date `before` would have seen it:
+    only bars dated before `before` are used. Pure computation — no network.
+
+    Returns a dict with: scored[profile] (ranked rows), missing[profile] (symbols
+    that did not score, by reason), summary (market-trend row or None), expected
+    (the session the run should be based on), coverage (share of fetched stocks
+    with a bar on that session), ready (coverage >= READY_FRACTION), diag.
+    """
     scored = {name: [] for name in PROFILES}
     missing = {name: {'fetch_failed': [], 'insufficient_data': []} for name in PROFILES}
     trends = []
     diag = {'trend_date': {}, 'dropped': [], 'hl_missing': []}
+    last_close = {}
 
-    for i, symbol in enumerate(symbols):
-        results, trend, reason, info = score_stock_all_profiles(symbol, before)
+    for symbol in symbols:
+        sym = symbol.strip().upper()
+        bars = bars_by_symbol.get(sym)
+        if bars is None:
+            for name in PROFILES:
+                missing[name]['fetch_failed'].append(sym)
+            continue
+        results, trend, reason, info = score_bars(sym, bars, before)
         if trend is not None:
             trends.append(trend)
-        sym = symbol.strip().upper()
+        last_close[sym] = info['last_close']
         diag['trend_date'][sym] = trend[0] if trend else None
         if info['dropped']:
             diag['dropped'].append(sym)
@@ -531,19 +574,26 @@ def score_universe(symbols, before=None):
                 scored[name].append(results[name])
             else:
                 missing[name][reason or 'insufficient_data'].append(sym)
-        if (i + 1) % 50 == 0:
-            counts = ', '.join(f'{k}={len(v)}' for k, v in scored.items())
-            print(f'  Progress: {i + 1}/{len(symbols)} — scored so far: {counts}')
 
-    for profile_name, rows in scored.items():
+    for rows in scored.values():
         rows.sort(key=lambda x: x['score'], reverse=True)
         for i, s in enumerate(rows):
             s['rank'] = i + 1
-        m = missing[profile_name]
-        print(f'  [{profile_name}] scored {len(rows)}/{len(symbols)} symbols '
-              f'(fetch failed: {len(m["fetch_failed"])}, too little history: {len(m["insufficient_data"])})')
 
-    return scored, missing, trends, diag
+    expected = prev_trading_day(before)
+    fresh = sum(1 for d in last_close.values() if d == expected)
+    coverage = fresh / len(bars_by_symbol) if bars_by_symbol else 0.0
+    summary = summarize_market_trend(trends)
+    return {
+        'before': before,
+        'scored': scored,
+        'missing': missing,
+        'summary': summary,
+        'expected': expected,
+        'coverage': coverage,
+        'ready': coverage >= READY_FRACTION - 1e-9,
+        'diag': diag,
+    }
 
 
 def describe_trend_gap(diag, session_iso, limit=8):
@@ -574,57 +624,106 @@ def describe_missing(m, limit=15):
 
 
 # ─────────────────────────────────────────────
-# HISTORY FILE APPEND (with guards)
+# HISTORY FILES: append today, reconcile recent days (with guards)
 # ─────────────────────────────────────────────
 
 DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
-def last_data_date(text):
-    """Date in the first column of the last data line, or None if header only."""
-    parts = text.rstrip().rsplit('\n', 1)
-    if len(parts) < 2:
-        return None
-    last = parts[1].split(',')[0].strip()
-    if not DATE_RE.match(last):
-        raise RuntimeError(f'last line of history file does not start with a date: {parts[1][:80]!r}')
-    return last
+def split_blocks(text):
+    """
+    Parse a history file into (header, order, blocks): order is the list of run
+    dates (ascending), blocks[date] the raw lines of that day. Raises if a date
+    is out of order or split across non-adjacent lines.
+    """
+    lines = [ln.rstrip('\r') for ln in text.split('\n')]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        raise RuntimeError('history file is empty')
+    header, order, blocks = lines[0].strip(), [], {}
+    for ln in lines[1:]:
+        d = ln.split(',', 1)[0]
+        if not DATE_RE.match(d):
+            raise RuntimeError(f'line does not start with a date: {ln[:80]!r}')
+        if d not in blocks:
+            if order and d < order[-1]:
+                raise RuntimeError(f'dates out of order around {d}')
+            order.append(d)
+            blocks[d] = []
+        elif d != order[-1]:
+            raise RuntimeError(f'rows for {d} are not contiguous')
+        blocks[d].append(ln)
+    return header, order, blocks
 
 
-def append_snapshot(repo, pat, name, cfg, rows, today_str, dry_run):
+def format_lines(rows, fields, date_str):
+    """CSV lines (no line endings) for rows dated date_str, formatted exactly as the writer does."""
+    text = csv_text([dict(r, date=date_str) for r in rows], fields, include_header=False)
+    return [ln for ln in text.split('\r\n') if ln]
+
+
+def update_history_text(existing, path, cfg, replacements, today_str, today_rows):
     """
-    Append today's rows to a profile's history file. Returns (status, detail)
-    with status 'written', 'dry_run' or 'skipped'. Raises on schema
-    mismatch, an unreadable file, or anything that would shrink the file.
+    Build the new text of a history file.
+
+    replacements: {run date: rows} to re-compute in place (a date that is not in
+    the file is only added when cfg['insert_missing'] is set). today_rows: rows to
+    append for today, or None. Everything else stays byte-identical. Returns
+    (new_text, report); report lists replaced dates (with changed-row counts),
+    inserted dates, guarded dates (size change too large) and whether today was
+    appended or skipped.
     """
-    path, fields = cfg['history_file'], cfg['fields']
-    existing, sha = github_get(repo, path, pat, allow_missing=True)
-    new_rows = [dict(r, date=today_str) for r in rows]
+    fields = cfg['fields']
+    header_expected = ','.join(fields)
+    report = {'replaced': {}, 'inserted': [], 'guarded': [], 'appended': False, 'skipped_today': None}
 
     if existing is None or not existing.strip():
-        text = csv_text(new_rows, fields, include_header=True)       # new (or blank) file
+        order, blocks = [], {}
     else:
-        header = existing.split('\n', 1)[0].strip()
-        if header != ','.join(fields):
+        header, order, blocks = split_blocks(existing)
+        if header != header_expected:
             raise RuntimeError(
                 f'{path}: header does not match the expected schema.\n'
-                f'  found:    {header}\n  expected: {",".join(fields)}')
-        last_date = last_data_date(existing)
-        if last_date is not None and last_date >= today_str:
-            return 'skipped', last_date
-        body = existing if existing.endswith('\n') else existing + '\r\n'
-        text = body + csv_text(new_rows, fields, include_header=False)
-        if not text.startswith(existing) or len(text) <= len(existing):
-            raise RuntimeError(f'{path}: new content would not extend the existing file — aborting')
+                f'  found:    {header}\n  expected: {header_expected}')
 
-    label, unit = cfg.get('label', 'Rank snapshot'), cfg.get('unit', 'stocks')
-    message = f'[{name}] {label} \u2014 {today_str} ({len(new_rows)} {unit})'
-    if dry_run:
-        print(f'  [{name}] DRY RUN — would write {len(new_rows)} rows to {path} ({len(text):,} chars)')
-        return 'dry_run', None
-    github_put(repo, path, pat, text, sha, message)
-    print(f'  [{name}] wrote {len(new_rows)} rows to {path} ({len(text):,} chars)')
-    return 'written', None
+    for d in sorted(replacements):
+        new_lines = format_lines(replacements[d], fields, d)
+        if d in blocks:
+            old = blocks[d]
+            if old and abs(len(new_lines) - len(old)) > BLOCK_TOLERANCE * len(old):
+                report['guarded'].append((d, len(old), len(new_lines)))
+                continue
+            if new_lines != old:
+                report['replaced'][d] = sum((Counter(new_lines) - Counter(old)).values())
+                blocks[d] = new_lines
+        elif cfg.get('insert_missing'):
+            bisect.insort(order, d)
+            blocks[d] = new_lines
+            report['inserted'].append(d)
+
+    if today_rows:
+        last = order[-1] if order else None
+        if last is not None and last >= today_str:
+            report['skipped_today'] = last
+        else:
+            order.append(today_str)
+            blocks[today_str] = format_lines(today_rows, fields, today_str)
+            report['appended'] = True
+
+    text = header_expected + '\r\n' + ''.join(ln + '\r\n' for d in order for ln in blocks[d])
+    return text, report
+
+
+def commit_message(name, cfg, report, today_str, today_count):
+    parts = []
+    if report['appended']:
+        parts.append(f"{cfg.get('label', 'Rank snapshot')} \u2014 {today_str} "
+                     f"({today_count} {cfg.get('unit', 'stocks')})")
+    fixed = sorted(set(report['replaced']) | set(report['inserted']))
+    if fixed:
+        parts.append('reconciled ' + ', '.join(fixed))
+    return f'[{name}] ' + '; '.join(parts)
 
 
 # ─────────────────────────────────────────────
@@ -666,6 +765,23 @@ def send_notice_email(lines, dry_run=False):
 
 
 # ─────────────────────────────────────────────
+# RUN STATUS (read by the viewer — the "did it run, and how" signal without email)
+# ─────────────────────────────────────────────
+
+def write_status(repo, pat, status, dry_run):
+    """Best effort: a failure here never affects the run."""
+    if dry_run:
+        return
+    try:
+        status = dict(status, finished_at=datetime.now(IST).isoformat(timespec='seconds'))
+        _, sha = github_get(repo, STATUS_FILE, pat, allow_missing=True)
+        github_put(repo, STATUS_FILE, pat, json.dumps(status, indent=2) + '\n', sha,
+                   f"[status] {status['outcome']} \u2014 {status['run_date']}")
+    except Exception as e:
+        print(f'  Could not write {STATUS_FILE}: {e}')
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -677,9 +793,13 @@ def main(args):
     args = args or {}
     dry_run = _flag(args.get('dry_run', False))
     force = _flag(args.get('force', False))
+    try:
+        reconcile_days = max(0, int(args.get('reconcile_days', RECONCILE_DAYS)))
+    except (TypeError, ValueError):
+        reconcile_days = RECONCILE_DAYS
 
     print('\n' + '=' * 55)
-    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT (dual formula)' + ('  [DRY RUN]' if dry_run else ''))
+    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT' + ('  [DRY RUN]' if dry_run else ''))
     print('=' * 55)
 
     pat = os.environ.get('GITHUB_PAT')
@@ -687,11 +807,12 @@ def main(args):
     now_ist = datetime.now(IST)
     today = now_ist.date()
     today_str = today.isoformat()
-    notices = []
-    nifty_flagged = False
+    notices = []          # emailed (outcome: warning)
+    problems = []         # emailed as a failure (outcome: failed)
+    status = {'run_date': today_str, 'outcome': 'ok', 'message': ''}
 
     try:
-        print('\n[1/5] Checking trading calendar...')
+        print('\n[1/6] Checking trading calendar...')
         try:
             cal_text, _ = github_get(repo_name, HOLIDAY_FILE, pat, allow_missing=True)
             if cal_text is not None:
@@ -708,113 +829,201 @@ def main(args):
             print(f'  {reason} \u2014 nothing to do.')
             if notices and today.weekday() < 5:
                 send_notice_email(notices, dry_run)
+            status.update(outcome='skipped', message=reason)
+            write_status(repo_name, pat, status, dry_run)
             return {'statusCode': 200, 'body': f'{reason}: skipped'}
 
-        ref_date = prev_trading_day(today)       # the job always works "as of the previous session"
-        nifty_date = fetch_ref_date(today)
-        print(f'  Last completed session (calendar): {ref_date} | NIFTY newest bar: {nifty_date}')
-        if nifty_date and nifty_date != ref_date:
-            nifty_flagged = True
-            notices.append(f"Calendar expects the last session to be {ref_date} but NIFTY's newest bar is "
-                           f'{nifty_date} \u2014 either Yahoo is lagging/ahead or the holiday list is wrong.')
-
-        print('\n[2/5] Loading watchlist...')
+        print('\n[2/6] Loading watchlist...')
         wl_text, _ = github_get(repo_name, WATCHLIST_FILE, pat)
         raw_symbols = [row['Symbol'].strip() for row in parse_csv(wl_text) if (row.get('Symbol') or '').strip()]
-        symbols = list(dict.fromkeys(raw_symbols))            # de-duplicate, keep order
+        symbols = list(dict.fromkeys(s.upper() for s in raw_symbols))      # de-duplicate, keep order
         if len(symbols) != len(raw_symbols):
             print(f'  Note: {len(raw_symbols) - len(symbols)} duplicate symbol(s) in watchlist ignored')
-        print(f'  Watchlist: {len(symbols)} symbols')
+        n = len(symbols)
+        print(f'  Watchlist: {n} symbols')
 
-        print('\n[3/5] Scoring universe (sequential fetch, both formulas)...')
-        scored, missing, trends, diag = score_universe(symbols, today)
-        summary = summarize_market_trend(trends)
+        print('\n[3/6] Fetching prices...')
+        bars_by_symbol, fetch_failed = fetch_universe(symbols)
+        if len(bars_by_symbol) < MIN_SCORED_FRACTION * n:
+            problems.append(f'Yahoo returned data for only {len(bars_by_symbol)}/{n} stocks '
+                            f'(fetch failed: {", ".join(fetch_failed[:15])}) \u2014 nothing was written.')
+
+        print('\n[4/6] Scoring today and checking recent days...')
+        ev_today = evaluate_asof(symbols, bars_by_symbol, fetch_failed, today)
+        expected = ev_today['expected']
+        summary = ev_today['summary']
+        session_iso = summary['session_date'] if summary else None
+        diag = ev_today['diag']
+        for name in PROFILES:
+            m = ev_today['missing'][name]
+            print(f"  [{name}] scored {len(ev_today['scored'][name])}/{n} "
+                  f"(fetch failed: {len(m['fetch_failed'])}, too little history: {len(m['insufficient_data'])})")
+        print(f"  Expected session {expected}: {ev_today['coverage']:.0%} of stocks have its bar "
+              f"({'complete' if ev_today['ready'] else 'still filling in'})")
         if diag['dropped']:
             print(f"  Ignored bars dated {today} or later for {len(diag['dropped'])} stock(s)")
-        session_iso = summary['session_date'] if summary else None
-        trend_gap = describe_trend_gap(diag, session_iso)
-        print(f'  Trend data: {trend_gap}')
+        print(f"  Trend data: {describe_trend_gap(diag, expected.isoformat())}")
 
-        # Guard each profile independently.
-        problems = []
-        write_plan = {}
-        n = len(symbols)
-        for name, rows in scored.items():
-            frac = len(rows) / n if n else 0.0
-            detail = describe_missing(missing[name])
-            if frac < MIN_SCORED_FRACTION:
-                problems.append(f'[{name}] only {len(rows)}/{n} stocks scored ({frac:.0%}) \u2014 below '
-                                f'{MIN_SCORED_FRACTION:.0%}, write skipped. Not scored \u2014 {detail}')
-                continue
-            if frac < WARN_SCORED_FRACTION:
-                notices.append(f'[{name}] {len(rows)}/{n} stocks scored ({frac:.0%}) \u2014 below the '
-                               f'{WARN_SCORED_FRACTION:.0%} warning level. Not scored \u2014 {detail}')
-            write_plan[name] = rows
+        # Calendar cross-check. Only worth an email when NIFTY *and* the stocks both
+        # disagree with the calendar (a lagging index alone is just Yahoo).
+        nifty_date = fetch_ref_date(today)
+        print(f'  Calendar expects session {expected} | NIFTY newest completed bar: {nifty_date} '
+              f'| majority of stocks: {session_iso}')
+        if nifty_date and nifty_date != expected and session_iso and session_iso != expected.isoformat():
+            notices.append(f"Calendar expects the last session to be {expected}, but NIFTY ({nifty_date}) and "
+                           f"most stocks ({session_iso}) both show another date \u2014 the holiday list may be wrong.")
 
-        # Market trend: written as one row per day, guarded like the profiles.
-        if summary is None:
-            problems.append(f'[trend] SuperTrend could not be computed for any stock \u2014 write skipped. {trend_gap}')
-        else:
-            tfrac = summary['total'] / n if n else 0.0
+        # --- today's rows --------------------------------------------------
+        fetch_ok = len(bars_by_symbol) >= MIN_SCORED_FRACTION * n
+        today_rows = {}
+        if fetch_ok:
+            for name, rows in ev_today['scored'].items():
+                frac = len(rows) / n if n else 0.0
+                if frac < MIN_SCORED_FRACTION:
+                    problems.append(f"[{name}] only {len(rows)}/{n} stocks scored ({frac:.0%}) \u2014 below "
+                                    f"{MIN_SCORED_FRACTION:.0%}, today's rows not written. Not scored \u2014 "
+                                    f"{describe_missing(ev_today['missing'][name])}")
+                else:
+                    today_rows[name] = rows
+        if fetch_ok and summary and ev_today['ready'] and session_iso == expected.isoformat():
+            today_rows['trend'] = [summary]
             print(f"  Market trend: {summary['trend']} \u2014 {summary['up']} up / {summary['down']} down "
                   f"of {summary['total']} ({summary['pct_up']}% up), session {summary['session_date']}")
-            if tfrac < MIN_SCORED_FRACTION:
-                problems.append(f"[trend] SuperTrend available for only {summary['total']}/{n} stocks "
-                                f"({tfrac:.0%}) \u2014 below {MIN_SCORED_FRACTION:.0%}, write skipped. {trend_gap}")
-            else:
-                if tfrac < WARN_SCORED_FRACTION:
-                    notices.append(f"[trend] SuperTrend available for {summary['total']}/{n} stocks "
-                                   f"({tfrac:.0%}) \u2014 below the {WARN_SCORED_FRACTION:.0%} warning level. {trend_gap}")
-                write_plan['trend'] = [summary]
-            if summary['session_date'] != ref_date.isoformat() and not nifty_flagged:
-                notices.append(f"Most stocks' latest bar is {summary['session_date']} but the calendar "
-                               f"expects {ref_date} \u2014 Yahoo lag, or the holiday list is wrong.")
+        else:
+            print(f"  Market trend row for {today_str} deferred \u2014 the session is not complete yet; "
+                  f"a later run fills it in.")
 
-        targets = dict(PROFILES)
-        targets['trend'] = TREND_CFG
-
-        print('\n[4/5] Appending to rank history file(s) on GitHub...')
-        written, skipped = {}, {}
-        failures = []
-        for name, rows in write_plan.items():
+        # --- read history files and decide which past days to reconcile -----
+        print('\n[5/6] Reading history files...')
+        existing, read_failures = {}, []
+        for name, cfg in TARGETS.items():
             try:
-                status, detail = append_snapshot(repo_name, pat, name, targets[name], rows, today_str, dry_run)
+                existing[name] = github_get(repo_name, cfg['history_file'], pat, allow_missing=True)
             except Exception as e:
-                failures.append(f'[{name}] write FAILED: {e}')
-                print(f'  [{name}] write FAILED: {e}')
+                read_failures.append(f'[{name}] could not read {cfg["history_file"]}: {e}')
+        problems.extend(read_failures)
+
+        window = []
+        std_text = existing.get('standard', (None, None))[0]
+        if fetch_ok and reconcile_days and std_text and std_text.strip():
+            try:
+                _, std_order, _ = split_blocks(std_text)
+                window = [d for d in std_order if d < today_str][-reconcile_days:]
+            except Exception as e:
+                problems.append(f'[standard] could not read the run dates for reconcile: {e}')
+
+        replacements = {name: {} for name in TARGETS}
+        pending = []
+        for d in window:
+            ev = evaluate_asof(symbols, bars_by_symbol, fetch_failed, parse_date(d))
+            if not ev['ready']:
+                pending.append((d, ev['coverage'], ev['expected']))
                 continue
-            if status == 'skipped':
-                skipped[name] = detail
-                print(f'  [{name}] {targets[name]["history_file"]} already has rows through {detail} '
-                      f'\u2014 nothing appended.')
-                if detail > today_str:
-                    notices.append(f'[{name}] history file already contains a date in the future ({detail}).')
-            else:
-                written[name] = len(rows)
+            for name in PROFILES:
+                if ev['scored'][name]:
+                    replacements[name][d] = ev['scored'][name]
+            if ev['summary'] and ev['summary']['session_date'] == ev['expected'].isoformat():
+                replacements['trend'][d] = [ev['summary']]
+        if window:
+            print(f"  Reconcile window: {window[0]} .. {window[-1]} ({len(window)} run dates); "
+                  f"complete: {len(window) - len(pending)}, still filling in: {len(pending)}")
+            for d, cov, exp in pending[:10]:
+                print(f"    {d}: {cov:.0%} of stocks have the {exp} bar yet")
+        if (pending and len(window) >= reconcile_days and pending[0][0] == window[0]
+                and reconcile_days <= MAX_DAILY_WINDOW):
+            d, cov, exp = pending[0]
+            problems.append(f"Run date {d} could not be finalized after {reconcile_days} runs \u2014 only "
+                            f"{cov:.0%} of stocks have a bar for {exp}. Its rows stay provisional; "
+                            f"re-run with reconcile_days once Yahoo has the data.")
 
-        print('\n[5/5] Wrapping up...')
-        summary = ', '.join(f'{k}={v}' for k, v in written.items()) or 'none'
-        if skipped:
-            summary += ' | skipped (already present): ' + ', '.join(f'{k} ({v})' for k, v in skipped.items())
+        print('\n[6/6] Writing history files...')
+        written, reconciled = {}, {}
+        for name, cfg in TARGETS.items():
+            if name not in existing:
+                continue
+            text0, sha = existing[name]
+            rows_today = today_rows.get(name)
+            if not rows_today and not replacements[name]:
+                continue
+            try:
+                text, report = update_history_text(text0, cfg['history_file'], cfg, replacements[name],
+                                                   today_str, rows_today)
+            except Exception as e:
+                problems.append(f'[{name}] FAILED: {e}')
+                print(f'  [{name}] FAILED: {e}')
+                continue
+            for d, old_n, new_n in report['guarded']:
+                problems.append(f'[{name}] reconcile refused for {d}: its row count would change from '
+                                f'{old_n} to {new_n} (more than {BLOCK_TOLERANCE:.0%}).')
+            if report['skipped_today']:
+                print(f"  [{name}] {cfg['history_file']} already has rows through {report['skipped_today']} "
+                      f"\u2014 nothing appended.")
+                if report['skipped_today'] > today_str:
+                    notices.append(f"[{name}] history file already contains a date in the future "
+                                   f"({report['skipped_today']}).")
+            fixed = sorted(set(report['replaced']) | set(report['inserted']))
+            if fixed:
+                reconciled[name] = fixed
+                for d in fixed:
+                    what = (f"inserted" if d in report['inserted'] else f"{report['replaced'][d]} rows changed")
+                    print(f'    [{name}] {d}: {what}')
+            if text == text0:
+                continue
+            if dry_run:
+                print(f"  [{name}] DRY RUN \u2014 would write {cfg['history_file']} "
+                      f"(append: {report['appended']}, reconciled dates: {len(fixed)}, {len(text):,} chars)")
+                if report['appended']:
+                    written[name] = len(rows_today)
+                continue
+            try:
+                github_put(repo_name, cfg['history_file'], pat, text, sha,
+                           commit_message(name, cfg, report, today_str, len(rows_today or [])))
+                print(f"  [{name}] wrote {cfg['history_file']} (append: {report['appended']}, "
+                      f"reconciled dates: {len(fixed)})")
+                if report['appended']:
+                    written[name] = len(rows_today)
+            except Exception as e:
+                problems.append(f'[{name}] write FAILED: {e}')
+                print(f'  [{name}] write FAILED: {e}')
 
-        if problems or failures:
-            lines = problems + failures
+        # --- wrap up --------------------------------------------------------
+        parts = [f'{k}={v}' for k, v in written.items()] or ['no new rows']
+        body = 'Wrote rows: ' + ', '.join(parts)
+        if reconciled:
+            body += ' | reconciled: ' + ', '.join(f'{k} {len(v)} date(s)' for k, v in reconciled.items())
+        if pending:
+            body += f' | {len(pending)} recent date(s) still filling in'
+
+        status.update(
+            wrote=written,
+            reconciled=reconciled,
+            provisional=[today_str] if not ev_today['ready'] else [],
+            pending=[d for d, _, _ in pending],
+        )
+        if problems:
+            lines = list(problems)
             if written:
                 lines.append('Written successfully: ' + ', '.join(f'{k} ({v} rows)' for k, v in written.items()))
             if notices:
                 lines.append('Other notices: ' + ' | '.join(notices))
             text = '\n\n'.join(lines)
             print(f'  ERROR: {text}')
+            status.update(outcome='failed', message=text[:500])
+            write_status(repo_name, pat, status, dry_run)
             send_failure_email(text, dry_run)
             return {'statusCode': 500, 'body': text}
 
         if notices:
+            status.update(outcome='warning', message=' | '.join(notices)[:500])
             send_notice_email(notices, dry_run)
-        print(f'\n  Done. Wrote rows: {summary}\n')
-        return {'statusCode': 200, 'body': f'Wrote rows: {summary}'}
+        write_status(repo_name, pat, status, dry_run)
+        print(f'\n  Done. {body}\n')
+        return {'statusCode': 200, 'body': body}
 
     except Exception as e:
         error_text = f'{str(e)}\n\n{traceback.format_exc()}'
         print(f'\n  ERROR: {error_text}')
+        status.update(outcome='failed', message=str(e)[:500])
+        write_status(repo_name, pat, status, dry_run)
         send_failure_email(error_text, dry_run)
         return {'statusCode': 500, 'body': str(e)}
