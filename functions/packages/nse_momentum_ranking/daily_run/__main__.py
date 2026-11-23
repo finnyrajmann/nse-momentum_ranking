@@ -60,6 +60,8 @@ show whether the job ran, and how, without any email.
 Invoke with {"dry_run": true} to do everything except write to GitHub, and
 {"force": true} to run on a non-session day. {"reconcile_days": 80} widens the
 reconcile window (one-off repair of history); 0 turns reconcile off.
+{"reconcile_only": true} only re-checks past days: it never writes today's rows
+or run_status.json and works on any day, weekends included.
 
 No pip installs needed — requests + standard library only.
 """
@@ -793,13 +795,15 @@ def main(args):
     args = args or {}
     dry_run = _flag(args.get('dry_run', False))
     force = _flag(args.get('force', False))
+    reconcile_only = _flag(args.get('reconcile_only', False))
     try:
         reconcile_days = max(0, int(args.get('reconcile_days', RECONCILE_DAYS)))
     except (TypeError, ValueError):
         reconcile_days = RECONCILE_DAYS
 
     print('\n' + '=' * 55)
-    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT' + ('  [DRY RUN]' if dry_run else ''))
+    print('  NSE MOMENTUM \u2014 DAILY RANK SNAPSHOT' + ('  [DRY RUN]' if dry_run else '')
+          + ('  [RECONCILE ONLY]' if reconcile_only else ''))
     print('=' * 55)
 
     pat = os.environ.get('GITHUB_PAT')
@@ -824,13 +828,13 @@ def main(args):
             print(f'  WARNING: could not load {HOLIDAY_FILE}: {e}')
         notices.extend(calendar_notices(today))
 
-        if not is_trading_day(today) and not force:
+        if not is_trading_day(today) and not force and not reconcile_only:
             reason = ('Weekend' if today.weekday() >= 5 else 'NSE trading holiday') + f' ({today})'
             print(f'  {reason} \u2014 nothing to do.')
             if notices and today.weekday() < 5:
                 send_notice_email(notices, dry_run)
             status.update(outcome='skipped', message=reason)
-            write_status(repo_name, pat, status, dry_run)
+            write_status(repo_name, pat, status, dry_run or reconcile_only)
             return {'statusCode': 200, 'body': f'{reason}: skipped'}
 
         print('\n[2/6] Loading watchlist...')
@@ -892,6 +896,10 @@ def main(args):
         else:
             print(f"  Market trend row for {today_str} deferred \u2014 the session is not complete yet; "
                   f"a later run fills it in.")
+
+        if reconcile_only:
+            today_rows = {}
+            print("  RECONCILE ONLY \u2014 today's rows and run_status.json are not written.")
 
         # --- read history files and decide which past days to reconcile -----
         print('\n[5/6] Reading history files...')
@@ -1009,14 +1017,14 @@ def main(args):
             text = '\n\n'.join(lines)
             print(f'  ERROR: {text}')
             status.update(outcome='failed', message=text[:500])
-            write_status(repo_name, pat, status, dry_run)
+            write_status(repo_name, pat, status, dry_run or reconcile_only)
             send_failure_email(text, dry_run)
             return {'statusCode': 500, 'body': text}
 
         if notices:
             status.update(outcome='warning', message=' | '.join(notices)[:500])
             send_notice_email(notices, dry_run)
-        write_status(repo_name, pat, status, dry_run)
+        write_status(repo_name, pat, status, dry_run or reconcile_only)
         print(f'\n  Done. {body}\n')
         return {'statusCode': 200, 'body': body}
 
@@ -1024,6 +1032,6 @@ def main(args):
         error_text = f'{str(e)}\n\n{traceback.format_exc()}'
         print(f'\n  ERROR: {error_text}')
         status.update(outcome='failed', message=str(e)[:500])
-        write_status(repo_name, pat, status, dry_run)
+        write_status(repo_name, pat, status, dry_run or reconcile_only)
         send_failure_email(error_text, dry_run)
         return {'statusCode': 500, 'body': str(e)}
