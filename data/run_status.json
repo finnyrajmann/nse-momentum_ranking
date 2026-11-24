@@ -1,24 +1,6 @@
 {
-  "run_date": "2026-11-23",
-  "outcome": "ok",
-  "message": "",
-  "wrote": {
-    "standard": 450,
-    "short": 454,
-    "trend": 1
-  },
-  "reconciled": {
-    "standard": [
-      "2026-11-20"
-    ],
-    "short": [
-      "2026-11-20"
-    ],
-    "trend": [
-      "2026-11-20"
-    ]
-  },
-  "provisional": [],
-  "pending": [],
-  "finished_at": "2026-11-23T08:53:57+05:30"
+  "run_date": "2026-11-24",
+  "outcome": "skipped",
+  "message": "NSE trading holiday (2026-11-24)",
+  "finished_at": "2026-11-24T08:50:41+05:30"
 }
