@@ -1,14 +1,15 @@
 {
-  "run_date": "2026-11-25",
+  "run_date": "2026-11-26",
   "outcome": "ok",
   "message": "",
   "wrote": {
     "standard": 450,
-    "short": 454,
-    "trend": 1
+    "short": 454
   },
   "reconciled": {},
-  "provisional": [],
+  "provisional": [
+    "2026-11-26"
+  ],
   "pending": [],
-  "finished_at": "2026-11-25T08:54:09+05:30"
+  "finished_at": "2026-11-26T08:54:08+05:30"
 }
